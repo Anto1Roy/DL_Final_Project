@@ -1,0 +1,20 @@
+# Core ML libraries
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data processing
+numpy>=1.23.0
+opencv-python>=4.6.0
+PyYAML>=6.0
+scipy>=1.9.0
+
+# Data loading & visualization
+tqdm>=4.64.0
+
+# Optional but recommended
+tensorboard>=2.10.0  # for training logs
+scikit-learn>=1.1.0  # for evaluation metrics
+
+# For working with datasets (if needed for BOP utils later)
+h5py>=3.7.0
+pandas>=1.4.0

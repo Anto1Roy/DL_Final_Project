@@ -4,7 +4,6 @@ This file describes the [BOP-scenewise](https://github.com/thodan/bop_toolkit/tr
 
 Datasets provided on the [BOP website](https://bop.felk.cvut.cz/datasets) are in the BOP-scenewise format with exception of the [MegaPose training datasets](https://github.com/thodan/bop_toolkit/blob/master/docs/bop_challenge_2023_training_datasets.md) provided for BOP Challenge 2023, which are in the BOP-webdataset format.
 
-
 ## Directory structure
 
 The datasets have the following structure:
@@ -30,44 +29,41 @@ DATASET_NAME
 │  │  ├─ mask_visib[_CAMTYPE]
 │  │  ├─ rgb|gray[_CAMTYPE]
 ```
+
 [_SPLITTYPE] and [_CAMTYPE] are defined to be sensor and/or modality names in multi-sensory datasets.
 
-* *models[\_MODELTYPE]* - 3D object models.
-* *models[\_MODELTYPE]\_eval* - "Uniformly" resampled and decimated 3D object
+- _models[\_MODELTYPE]_ - 3D object models.
+- _models[\_MODELTYPE]\_eval_ - "Uniformly" resampled and decimated 3D object
   models used for calculation of errors of object pose estimates.
 
+- _train[\_TRAINTYPE]/X_ (optional) - Training images of object X.
+- _val[\_VALTYPE]/Y_ (optional) - Validation images of scene Y.
+- _test[\_TESTTYPE]/Y_ - Test images of scene Y.
+- _onboarding_static/obj_X_SIDE_ - Only for model-free tasks, static onboarding images of object X at up/down side.
+- _onboarding_dynamic/obj_X_ - Only for model-free tasks, dynamic onboarding images of object X.
 
-* *train[\_TRAINTYPE]/X* (optional) - Training images of object X.
-* *val[\_VALTYPE]/Y* (optional) - Validation images of scene Y.
-* *test[\_TESTTYPE]/Y* - Test images of scene Y.
-* *onboarding_static/obj_X_SIDE* - Only for model-free tasks, static onboarding images of object X at up/down side.
-* *onboarding_dynamic/obj_X* - Only for model-free tasks, dynamic onboarding images of object X.
+- _camera.json_ - Camera parameters (for sensor simulation only; per-image
+  camera parameters are in files _scene_camera.json_ - see below).
+- _dataset_info.md_ - Dataset-specific information.
+- _test_targets_bop19.json_ - A list of test targets used for the localization evaluation since the BOP Challenge 2019.
+- _test_targets_bop24.json_ - A list of test targets used for the detection evaluation since the BOP Challenge 2024.
+- _test_targets_multiview_bop25.json_ - A list of test targets used for the multi-view detection evaluation since the BOP Challenge 2025.
 
-
-* *camera.json* - Camera parameters (for sensor simulation only; per-image
-  camera parameters are in files *scene_camera.json* - see below).
-* *dataset_info.md* - Dataset-specific information.
-* *test_targets_bop19.json* - A list of test targets used for the localization evaluation since the BOP Challenge 2019.
-* *test_targets_bop24.json* - A list of test targets used for the detection evaluation since the BOP Challenge 2024.
-* *test_targets_multiview_bop25.json* - A list of test targets used for the multi-view detection evaluation since the BOP Challenge 2025.
-
-
-*MODELTYPE*, *TRAINTYPE*, *VALTYPE* and *TESTTYPE* are optional and used if more
+_MODELTYPE_, _TRAINTYPE_, _VALTYPE_ and _TESTTYPE_ are optional and used if more
 data types are available (e.g. images from different sensors).
 
-The images in *train*, *val* and *test* folders are organized into subfolders:
+The images in _train_, _val_ and _test_ folders are organized into subfolders:
 
-* *rgb/gray* - Color/gray images.
-* *depth* - Depth images (saved as 16-bit unsigned short).
-* *mask* (optional) - Masks of object silhouettes.
-* *mask_visib* (optional) - Masks of the visible parts of object silhouettes.
+- _rgb/gray_ - Color/gray images.
+- _depth_ - Depth images (saved as 16-bit unsigned short).
+- _mask_ (optional) - Masks of object silhouettes.
+- _mask_visib_ (optional) - Masks of the visible parts of object silhouettes.
 
 The corresponding images across the subolders have the same ID, e.g.
-*rgb/000000.png* and *depth/000000.png* is the color and the depth image
+_rgb/000000.png_ and _depth/000000.png_ is the color and the depth image
 of the same RGB-D frame. The naming convention for the masks is IMID_GTID.png,
 where IMID is an image ID and GTID is the index of the ground-truth annotation
-(stored in *scene_gt.json*).
-
+(stored in _scene_gt.json_).
 
 ## Training, validation and test images
 
@@ -78,82 +74,80 @@ test images with private ground-truth annotations can be calculated in the
 
 ### Camera parameters
 
-Each set of images is accompanied with file *scene\_camera.json* which contains
+Each set of images is accompanied with file _scene_camera.json_ which contains
 the following information for each image:
 
-* *cam\_K* - 3x3 intrinsic camera matrix K (saved row-wise).
-* *depth_scale* - Multiply the depth image with this factor to get depth in mm.
-* *cam\_R\_w2c* (optional) - 3x3 rotation matrix R\_w2c (saved row-wise).
-* *cam\_t\_w2c* (optional) - 3x1 translation vector t\_w2c.
-* *view\_level* (optional) - Viewpoint subdivision level, see below.
+- _cam_K_ - 3x3 intrinsic camera matrix K (saved row-wise).
+- _depth_scale_ - Multiply the depth image with this factor to get depth in mm.
+- _cam_R_w2c_ (optional) - 3x3 rotation matrix R_w2c (saved row-wise).
+- _cam_t_w2c_ (optional) - 3x1 translation vector t_w2c.
+- _view_level_ (optional) - Viewpoint subdivision level, see below.
 
 The matrix K may be different for each image. For example, the principal point
 is not constant for images in T-LESS as the images were obtained by cropping a
 region around the projection of the origin of the world coordinate system.
 
 Note that the intrinsic camera parameters can be found also in file
-*camera.json* in the root folder of a dataset. These parameters are meant only
+_camera.json_ in the root folder of a dataset. These parameters are meant only
 for simulation of the used sensor when rendering training images.
 
-P\_w2i = K * [R\_w2c, t\_w2c] is the camera matrix which transforms 3D point
-p\_w = [x, y, z, 1]' in the world coordinate system to 2D point p\_i =
-[u, v, 1]' in the image coordinate system: s * p\_i = P\_w2i * p\_w.
+P_w2i = K _ [R\_w2c, t\_w2c] is the camera matrix which transforms 3D point
+p_w = [x, y, z, 1]' in the world coordinate system to 2D point p_i =
+[u, v, 1]' in the image coordinate system: s _ p_i = P_w2i \* p_w.
 
 ### Ground-truth annotations
 
-The ground truth object poses are provided in files *scene_gt.json* which
+The ground truth object poses are provided in files _scene_gt.json_ which
 contain the following information for each annotated object instance:
 
-* *obj\_id* - Object ID.
-* *cam\_R\_m2c* - 3x3 rotation matrix R\_m2c (saved row-wise).
-* *cam\_t\_m2c* - 3x1 translation vector t\_m2c.
+- _obj_id_ - Object ID.
+- _cam_R_m2c_ - 3x3 rotation matrix R_m2c (saved row-wise).
+- _cam_t_m2c_ - 3x1 translation vector t_m2c.
 
-P\_m2i = K * [R\_m2c, t\_m2c] is the camera matrix which transforms 3D point
-p\_m = [x, y, z, 1]' in the model coordinate system to 2D point p\_i =
-[u, v, 1]' in the image coordinate system: s * p\_i = P\_m2i * p\_m.
+P_m2i = K _ [R\_m2c, t\_m2c] is the camera matrix which transforms 3D point
+p_m = [x, y, z, 1]' in the model coordinate system to 2D point p_i =
+[u, v, 1]' in the image coordinate system: s _ p_i = P_m2i \* p_m.
 
-Ground truth bounding boxes and instance masks are also provided in COCO format under *scene_gt_coco.json*. The RLE format is used for segmentations. Detailed information about the COCO format can be found [here](https://cocodataset.org/#format-data). 
+Ground truth bounding boxes and instance masks are also provided in COCO format under _scene_gt_coco.json_. The RLE format is used for segmentations. Detailed information about the COCO format can be found [here](https://cocodataset.org/#format-data).
 
 ### Meta information about the ground-truth poses
 
 The following meta information about the ground-truth poses is provided in files
-*scene_gt_info.json* (calculated using *scripts/calc_gt_info.py*, with delta =
+_scene_gt_info.json_ (calculated using _scripts/calc_gt_info.py_, with delta =
 5mm for ITODD, 15mm for other datasets, and 5mm for all photorealistic training
 images provided for the BOP Challenge 2020):
 
-* *bbox\_obj* - 2D bounding box of the object silhouette given by (x, y, width,
+- _bbox_obj_ - 2D bounding box of the object silhouette given by (x, y, width,
   height), where (x, y) is the top-left corner of the bounding box.
-* *bbox\_visib* - 2D bounding box of the visible part of the object silhouette.
-* *px\_count\_all* - Number of pixels in the object silhouette.
-* *px\_count\_valid* - Number of pixels in the object silhouette with a valid
+- _bbox_visib_ - 2D bounding box of the visible part of the object silhouette.
+- _px_count_all_ - Number of pixels in the object silhouette.
+- _px_count_valid_ - Number of pixels in the object silhouette with a valid
   depth measurement (i.e. with a non-zero value in the depth image).
-* *px\_count\_visib* - Number of pixels in the visible part of the object
+- _px_count_visib_ - Number of pixels in the visible part of the object
   silhouette.
-* *visib\_fract* - The visible fraction of the object silhouette (= *px\_count\_visib*/*px\_count
-_all*).
-
+- _visib_fract_ - The visible fraction of the object silhouette (= _px_count_visib_/_px_count
+  \_all_).
 
 ## Acquisition of training images
 
 Most of the datasets include training images which were obtained either by
 capturing real objects from various viewpoints or by rendering 3D object models
-(using *scripts/render_train_imgs.py*).
+(using _scripts/render_train_imgs.py_).
 
 The viewpoints, from which the objects were rendered, were sampled from a view
 sphere as in [2] by recursively subdividing an icosahedron. The level of
-subdivision at which a viewpoint was added is saved in *scene_camera.json* as
-*view_level* (viewpoints corresponding to vertices of the icosahedron have
-*view_level* = 0, viewpoints obtained in the first subdivision step have
-*view_level* = 1, etc.). To reduce the number of viewpoints while preserving
+subdivision at which a viewpoint was added is saved in _scene_camera.json_ as
+_view_level_ (viewpoints corresponding to vertices of the icosahedron have
+_view_level_ = 0, viewpoints obtained in the first subdivision step have
+_view_level_ = 1, etc.). To reduce the number of viewpoints while preserving
 their "uniform" distribution over the sphere surface, one can consider only
-viewpoints with *view_level* <= n, where n is the highest considered level of
+viewpoints with _view_level_ <= n, where n is the highest considered level of
 subdivision.
 
 For rendering, the radius of the view sphere was set to the distance of the
 closest occurrence of any annotated object instance over all test images. The
 distance was calculated from the camera center to the origin of the model
 coordinate system.
-
 
 ## 3D object models
 
@@ -164,10 +158,9 @@ The vertex normals were calculated using
 [MeshLab](http://meshlab.sourceforge.net/) as the angle-weighted sum of face
 normals incident to a vertex [4].
 
-Each folder with object models contains file *models_info.json*, which includes
+Each folder with object models contains file _models_info.json_, which includes
 the 3D bounding box and the diameter for each object model. The diameter is
 calculated as the largest distance between any pair of model vertices.
-
 
 ## Coordinate systems
 
@@ -179,21 +172,19 @@ The camera coordinate system is as in
 [OpenCV](http://docs.opencv.org/2.4/modules/calib3d/doc/camera_calibration_and_3d_reconstruction.html)
 with the camera looking along the Z axis.
 
-
 ## Units
 
-* Depth images: See files *camera.json/scene_camera.json* in individual
+- Depth images: See files _camera.json/scene_camera.json_ in individual
   datasets.
-* 3D object models: 1 mm
-* Translation vectors: 1 mm
-
+- 3D object models: 1 mm
+- Translation vectors: 1 mm
 
 ## References
 
 [1] Hodan, Michel et al. "BOP: Benchmark for 6D Object Pose Estimation" ECCV'18.
 
 [2] Hinterstoisser et al. "Model based training, detection and pose estimation
-    of texture-less 3d objects in heavily cluttered scenes" ACCV'12.
+of texture-less 3d objects in heavily cluttered scenes" ACCV'12.
 
 [3] Thurrner and Wuthrich "Computing vertex normals from polygonal
-    facets" Journal of Graphics Tools 3.1 (1998).
+facets" Journal of Graphics Tools 3.1 (1998).
