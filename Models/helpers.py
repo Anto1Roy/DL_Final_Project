@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 from torch.autograd import Variable
 
 
-def conv_block(in_dim,out_dim,act_fn):
+def conv_block(in_dim, out_dim, act_fn):
     model = nn.Sequential(
         nn.Conv2d(in_dim,out_dim, kernel_size=3, stride=1, padding=1),
         nn.BatchNorm2d(out_dim),
@@ -34,9 +34,9 @@ def maxpool():
 
 def conv_block_3(in_dim,out_dim,act_fn):
     model = nn.Sequential(
-        conv_block(in_dim,out_dim,act_fn),
-        conv_block(out_dim,out_dim,act_fn),
-        nn.Conv2d(out_dim,out_dim, kernel_size=3, stride=1, padding=1),
+        conv_block(in_dim, out_dim, act_fn),
+        conv_block(out_dim, out_dim, act_fn),
+        nn.Conv2d(out_dim, out_dim, kernel_size=3, stride=1, padding=1),
         nn.BatchNorm2d(out_dim),
     )
     return model

@@ -14,7 +14,7 @@ def main():
     # 👇 Hardcoded config paths
     configs = [
         "Config/config_fusenet_2.yaml",
-        # "Config/config_fusenet_4.yaml"
+        "Config/config_fusenet_4.yaml"
     ]
 
     for config in configs:
