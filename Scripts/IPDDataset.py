@@ -13,12 +13,13 @@ sys.path.append(os.getcwd())
 class IPDValidationDataset(Dataset):
     def __init__(self, root_dir, cam_ids, modalities=["rgb", "depth"], split="val", transform=None):
         self.root_dir = root_dir
+        self.img_size = (640, 480)
         self.cam_ids = cam_ids
         self.modalities = modalities
         self.split = split
         self.transform = transform or transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((512, 512)),  # <-- Resize here
+            transforms.Resize(self.img_size),  # <-- Resize here
             transforms.ToTensor()
         ])
 
@@ -78,7 +79,7 @@ class IPDValidationDataset(Dataset):
         fx, fy = cam_cfg["fx"], cam_cfg["fy"]
         cx, cy = cam_cfg["cx"], cam_cfg["cy"]
         W_orig, H_orig = cam_cfg["width"], cam_cfg["height"]
-        W_new, H_new = 512, 512  # Your resized image shape
+        W_new, H_new = self.img_size  # Your resized image shape
 
         # Scale intrinsics to match new size
         scale_x = W_new / W_orig

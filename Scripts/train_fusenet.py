@@ -56,13 +56,13 @@ def main():
     # --- Model ---
     in_channels = len(modalities)
     # model = nn.DataParallel(FuseNetPoseModel(in_channels=in_channels)).to(device)
-    model = FuseNetPoseModel(in_channels=in_channels).to(device)
-
-    if os.path.exists("./weights/fusenet_pose.pkl"):
-        model.load_state_dict(torch.load(f"./weights/fusenet_pose_{len(modalities)}x.pkl"))
-        print("\n--------weights restored--------\n")
-    else:
-        print("\n--------new weights created--------\n")
+    model = FuseNetPoseModel(in_channels=in_channels, fc_width=256).to(device)
+    file_path = f"./weights/fusenet_pose_{len(modalities)}y.pth"
+    # if os.path.exists(file_path):
+    #     model.load_state_dict(torch.load(file_path, weights_only=True))
+    #     print("\n--------weights restored--------\n")
+    # else:
+    #     print("\n--------new weights created--------\n")
 
     # --- Separate optimizers ---
     rot_params = []
@@ -97,7 +97,6 @@ def main():
             t_gt = Variable(t_gt).to(device)
 
             rot_optimizer.zero_grad()
-            print("here")
             quat, trans, rot_loss, trans_loss = model(x, R_gt, t_gt)
 
             # Inside training loop:
@@ -115,13 +114,13 @@ def main():
 
         # Save weights checkpoint
         os.makedirs("./weights", exist_ok=True)
-        torch.save(model.state_dict(), f"./weights/fusenet_pose_{len(modalities)}x.pkl")
+        torch.save(model.state_dict(), f"./weights/fusenet_pose_{len(modalities)}y.pth")
 
     # save losses
-    with open(f"trans_loss_{len(modalities)}x", "w") as f:
+    with open(f"trans_loss_{len(modalities)}y", "w") as f:
         json.dump(trans_losses, f)    
 
-    with open(f"rot_loss_{len(modalities)}x", "w") as f:
+    with open(f"rot_loss_{len(modalities)}y", "w") as f:
         json.dump(rot_losses, f)    
 
 if __name__ == "__main__":

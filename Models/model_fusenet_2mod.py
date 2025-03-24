@@ -42,11 +42,15 @@ class FuseNetPoseModel(nn.Module):
         self.pool_3 = maxpool()
         self.down_4 = Conv_residual_conv(ngf * 4, ngf * 8, act_fn)
         self.pool_4 = maxpool()
+        self.down_5 = Conv_residual_conv(ngf * 8, ngf * 16, act_fn)
+        self.pool_5 = maxpool()
 
         # Bridge
-        self.bridge = Conv_residual_conv(ngf * 8, ngf * 16, act_fn)
+        self.bridge = Conv_residual_conv(ngf * 16, ngf * 32, act_fn)
 
         # Decoder
+        self.deconv_0 = conv_trans_block(ngf * 32, ngf * 16, act_fn_2)
+        self.up_0 = Conv_residual_conv(ngf * 16, ngf * 16, act_fn_2)
         self.deconv_1 = conv_trans_block(ngf * 16, ngf * 8, act_fn_2)
         self.up_1 = Conv_residual_conv(ngf * 8, ngf * 8, act_fn_2)
         self.deconv_2 = conv_trans_block(ngf * 8, ngf * 4, act_fn_2)
@@ -65,26 +69,40 @@ class FuseNetPoseModel(nn.Module):
         )
 
     def forward(self, x, R_gt=None, t_gt=None):
+
         down_1 = self.down_1(x)
         pool_1 = self.pool_1(down_1)
+
         down_2 = self.down_2(pool_1)
         pool_2 = self.pool_2(down_2)
+
         down_3 = self.down_3(pool_2)
         pool_3 = self.pool_3(down_3)
+
         down_4 = self.down_4(pool_3)
         pool_4 = self.pool_4(down_4)
+        
+        down_5 = self.down_5(pool_4)
+        pool_5 = self.pool_5(down_5)
 
-        bridge = self.bridge(pool_4)
+        bridge = self.bridge(pool_5)
 
-        deconv_1 = self.deconv_1(bridge)
+        deconv_0 = self.deconv_0(bridge)
+        skip_0 = (deconv_0 + down_5) / 2
+        up_0 = self.up_0(skip_0)
+
+        deconv_1 = self.deconv_1(up_0)
         skip_1 = (deconv_1 + down_4) / 2
         up_1 = self.up_1(skip_1)
+
         deconv_2 = self.deconv_2(up_1)
         skip_2 = (deconv_2 + down_3) / 2
         up_2 = self.up_2(skip_2)
+
         deconv_3 = self.deconv_3(up_2)
         skip_3 = (deconv_3 + down_2) / 2
         up_3 = self.up_3(skip_3)
+
         deconv_4 = self.deconv_4(up_3)
         skip_4 = (deconv_4 + down_1) / 2
         up_4 = self.up_4(skip_4)
