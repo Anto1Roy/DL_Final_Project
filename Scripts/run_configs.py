@@ -13,7 +13,7 @@ def run_training(config_path):
 def main():
     # 👇 Hardcoded config paths
     configs = [
-        "Config/config_fusenet_2.yaml",
+        # "Config/config_fusenet_2.yaml",
         "Config/config_fusenet_4.yaml"
     ]
 

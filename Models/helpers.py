@@ -18,7 +18,7 @@ def conv_block(in_dim, out_dim, act_fn):
     return model
 
 
-def conv_trans_block(in_dim,out_dim,act_fn):
+def conv_trans_block(in_dim, out_dim,act_fn):
     model = nn.Sequential(
         nn.ConvTranspose2d(in_dim,out_dim, kernel_size=3, stride=2, padding=1,output_padding=1),
         nn.BatchNorm2d(out_dim),

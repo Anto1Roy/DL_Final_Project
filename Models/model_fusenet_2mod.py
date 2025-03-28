@@ -9,6 +9,7 @@ import sys
 sys.path.append(os.getcwd())
 from Models.helpers import *
 
+
 class Conv_residual_conv(nn.Module):
     def __init__(self, in_dim, out_dim, act_fn):
         super().__init__()
@@ -25,9 +26,9 @@ class Conv_residual_conv(nn.Module):
 
 
 class FuseNetPoseModel(nn.Module):
-    def __init__(self, in_channels=2, fc_width=64):
+    def __init__(self, in_channels=2, fc_width=128):
         super().__init__()
-        ngf = 64
+        ngf = 128
         act_fn = nn.LeakyReLU(0.2, inplace=True)
         act_fn_2 = nn.ReLU()
 
@@ -60,16 +61,23 @@ class FuseNetPoseModel(nn.Module):
         self.deconv_4 = conv_trans_block(ngf * 2, ngf, act_fn_2)
         self.up_4 = Conv_residual_conv(ngf, ngf, act_fn_2)
 
+        # Refinement block
+        self.refine = nn.Sequential(
+            nn.Conv2d(ngf, ngf, kernel_size=3, padding=1),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(),
+        )
+
         # Pose Regression Head (multi-layered)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
             nn.Linear(ngf, fc_width), nn.ReLU(),
-            nn.Linear(fc_width, int(fc_width / 2)), nn.ReLU(),
-            nn.Linear(int(fc_width / 2), 7)  # quaternion (4) + translation (3)
+            nn.Linear(fc_width, fc_width), nn.ReLU(),
+            nn.Linear(fc_width, fc_width // 2), nn.ReLU(),
+            nn.Linear(fc_width // 2, 7)
         )
 
     def forward(self, x, R_gt=None, t_gt=None):
-
         down_1 = self.down_1(x)
         pool_1 = self.pool_1(down_1)
 
@@ -81,7 +89,7 @@ class FuseNetPoseModel(nn.Module):
 
         down_4 = self.down_4(pool_3)
         pool_4 = self.pool_4(down_4)
-        
+
         down_5 = self.down_5(pool_4)
         pool_5 = self.pool_5(down_5)
 
@@ -107,7 +115,8 @@ class FuseNetPoseModel(nn.Module):
         skip_4 = (deconv_4 + down_1) / 2
         up_4 = self.up_4(skip_4)
 
-        pooled = self.global_pool(up_4).squeeze(-1).squeeze(-1)  # (B, ngf)
+        refined = self.refine(up_4)
+        pooled = self.global_pool(refined).squeeze(-1).squeeze(-1)
         pose = self.fc(pooled)
         quat = F.normalize(pose[:, :4], dim=1)
         trans = pose[:, 4:]

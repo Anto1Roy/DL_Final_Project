@@ -5,12 +5,12 @@ dataset:
   split: val
 
 training:
-  batch_size: 4
+  batch_size: 1
   epochs: 1
-  num_workers: 4
+  num_workers: 2
   device: cuda
 
 optim:
-  lr_rot: 1e-4
-  lr_trans: 1e-3
+  lr_rot: 1e-5
+  lr_trans: 1e-4
   weight_decay: 0.0

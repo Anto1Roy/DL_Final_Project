@@ -5,9 +5,9 @@ dataset:
   split: val
 
 training:
-  batch_size: 4
-  epochs: 2
-  num_workers: 4
+  batch_size: 1
+  epochs: 1
+  num_workers: 2
   device: cuda
 
 optim:

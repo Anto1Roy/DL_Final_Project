@@ -64,12 +64,12 @@ class IPDValidationDataset(Dataset):
                 input_modalities.append(self.transform((depth.astype(np.float32) / 65535.0)[:, :, None]))
             elif modality == "aolp":
                 aolp = cv2.imread(os.path.join(base, f"aolp_{cam_id}", f"{fid}.png"), 0)
-                input_modalities.append(self.transform((aolp / 255.0)[:, :, None]))
+                input_modalities.append(self.transform((aolp.astype(np.float32) / 255.0)[:, :, None]))
             elif modality == "dolp":
                 dolp = cv2.imread(os.path.join(base, f"dolp_{cam_id}", f"{fid}.png"), 0)
-                input_modalities.append(self.transform((dolp / 255.0)[:, :, None]))
-
-        x = torch.cat(input_modalities, dim=0)  # shape: (C, H, W)
+                input_modalities.append(self.transform((dolp.astype(np.float32) / 255.0)[:, :, None]))
+        
+        x_dict = {modality: tensor for modality, tensor in zip(self.modalities, input_modalities)}
 
         # Load intrinsics from camera config (shared per cam)
         cam_idx = int(cam_id.replace("cam", ""))  # e.g., "cam2" → 2
@@ -98,4 +98,4 @@ class IPDValidationDataset(Dataset):
             R = torch.tensor(gt["cam_R_m2c"]).reshape(3, 3)
             t = torch.tensor(gt["cam_t_m2c"]) / 1000.0  # mm to meters
 
-        return x, R, t, K
+        return x_dict, R, t, K
