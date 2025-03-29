@@ -1,0 +1,15 @@
+dataset:
+  remote_base_url: X:\ipd
+  cam_ids: ["cam1"]
+  modality: ["rgb", "depth"]
+  split: val
+
+training:
+  batch_size: 1
+  epochs: 1
+  num_workers: 1
+  device: cuda
+
+optim:
+  lr_rot: 1e-4
+  lr_trans: 1e-4
