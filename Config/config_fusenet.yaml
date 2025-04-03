@@ -1,0 +1,21 @@
+dataset:
+  remote_base_url: ipd_data/ipd
+  cam_ids: [cam2]
+  modality: [rgb, depth, aolp, dolp]
+  split: val
+
+training:
+  batch_size: 1
+  epochs: 1
+  num_workers: 4
+  device: cuda
+  patience: 10
+
+optim:
+  lr_rot: 1e-5
+  lr_trans: 1e-4
+  weight_decay: 0.0
+
+renderer:
+  image_size: 256
+  device: cuda
