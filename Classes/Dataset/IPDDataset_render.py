@@ -6,11 +6,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-from kaolin.io.obj import import_mesh
+# from kaolin.io.obj import import_mesh
+import trimesh
 
 # --- Local Import ---
 sys.path.append(os.getcwd())
-from StreamingFileManager import StreamingFileManager
+from Classes.Dataset.StreamingFileManager import StreamingFileManager
 
 class IPDDatasetMounted(Dataset):
     def __init__(self, remote_base_url, cam_ids, modalities=["rgb", "depth"], split="val", transform=None, models_dir=None):
@@ -50,16 +51,20 @@ class IPDDatasetMounted(Dataset):
         fid = frame_id.zfill(6)
         fid_key = str(int(frame_id))
 
+        # model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+        # verts, faces = import_mesh(model_path)
         model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-        verts, faces = import_mesh(model_path)
-        cad_model_data = (verts.unsqueeze(0), faces.unsqueeze(0))
+        mesh = trimesh.load(model_path, process=False)
+        verts = torch.tensor(mesh.vertices, dtype=torch.float32)  # ✅ No unsqueeze
+        faces = torch.tensor(mesh.faces, dtype=torch.long)        # ✅ No unsqueeze
+        cad_model_data = (verts, faces)  # ✅ Remove double unsqueeze
 
         base_remote = f"{self.split}/{scene_id}"
 
         input_modalities = []
         for modality in self.modalities:
             if modality == "rgb":
-                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.jpg"
+                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
             else:
                 remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
             img = self.read_img(remote_path, modality)

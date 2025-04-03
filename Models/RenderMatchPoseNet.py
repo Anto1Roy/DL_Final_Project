@@ -2,13 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys, os
-from kaolin.render import DIBRenderer as KaolinRenderer
-from kaolin.io.obj import import_mesh
 
 # --- Local Imports ---
 sys.path.append(os.getcwd())
 from Models.helpers import *
 from Models.FuseNetModel import FuseEncoder
+from Models.KaolinRenderer import KaolinRenderer
 
 class RenderMatchPoseNet(nn.Module):
     def __init__(self, sensory_channels, renderer_config, num_candidates=32):
@@ -18,8 +17,8 @@ class RenderMatchPoseNet(nn.Module):
 
         self.renderer_config = renderer_config
         self.renderer = KaolinRenderer(
-            height=renderer_config["image_size"],
-            width=renderer_config["image_size"],
+            image_size=renderer_config["image_size"],
+            fov=renderer_config.get("fov", 60.0),
             device=renderer_config["device"]
         )
 
@@ -39,7 +38,15 @@ class RenderMatchPoseNet(nn.Module):
         """
         B, N = candidate_poses.shape[:2]
         device = candidate_poses.device
-        verts, faces = cad_model_data  # unpack Kaolin mesh data
+
+        verts, faces = cad_model_data  # unpack mesh
+
+        print(verts.shape, faces.shape)
+        # verts: (V, 3), faces: (F, 3)
+
+        # Repeat verts and faces for batch size B
+        verts = verts.to(device).repeat(B, 1, 1)   # (B, V, 3)
+        faces = faces.to(device).repeat(B, 1, 1)   # (B, F, 3)
 
         # Encode input scene
         x_latent, _ = self.encoder(x_dict)
@@ -51,13 +58,7 @@ class RenderMatchPoseNet(nn.Module):
             R = pose[:, :3, :3]
             T = pose[:, :3, 3]
 
-            images = self.renderer.render(
-                vertices=verts,
-                faces=faces,
-                camera_rot=R,
-                camera_pos=T,
-                fov=60.0
-            )  # output: (B, H, W, 3)
+            images = self.renderer(verts, faces, R, T)  # (B, H, W, 3)
 
             rendered_dict = {"rgb": images.permute(0, 3, 1, 2)}
             cad_latent, _ = self.encoder(rendered_dict)

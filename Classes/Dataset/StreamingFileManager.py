@@ -1,6 +1,4 @@
 import os
-import hashlib
-import gdown
 
 class StreamingFileManager:
     def __init__(self, remote_base_url, cache_dir="/tmp/ipd_cache"):

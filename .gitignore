@@ -1,2 +1,5 @@
 /ipd_data/*
 *.log
+*.pyc
+*.pkl
+*.pth

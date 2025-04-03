@@ -1,6 +1,8 @@
 # --- Imports ---
 import json
 import torch
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import DataLoader, SubsetRandomSampler
 import torch.nn as nn
 from torch.autograd import Variable
@@ -14,7 +16,7 @@ import numpy as np
 # --- Local Import ---
 sys.path.append(os.getcwd())
 from Models.RenderMatchPoseNet import RenderMatchPoseNet
-from IPDDataset_render import IPDDatasetMounted
+from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Classes.EarlyStopping import EarlyStopping
 
 def save_checkpoint(state, filename):
@@ -122,7 +124,7 @@ def main():
             x_dict = {modality: Variable(x).to(device) for modality, x in x_dict.items()}
             R_gt = Variable(R_gt).to(device)
             t_gt = Variable(t_gt).to(device)
-            cad_model = cad_model.to(device)
+            # cad_model = cad_model.to(device)
             candidate_poses = candidate_poses.to(device)
 
             optimizer.zero_grad()
@@ -151,7 +153,7 @@ def main():
                 x_dict = {modality: x.to(device) for modality, x in x_dict.items()}
                 R_gt = R_gt.to(device)
                 t_gt = t_gt.to(device)
-                cad_model = cad_model.to(device)
+                # cad_model = cad_model.to(device)
                 candidate_poses = candidate_poses.to(device)
 
                 R_pred, t_pred = model(x_dict, cad_model, candidate_poses)
