@@ -6,54 +6,65 @@ import sys, os
 # --- Local Imports ---
 sys.path.append(os.getcwd())
 from Models.helpers import *
-from Models.FuseNetModel import FuseEncoder, FuseDecoder
+from Models.FuseNet import FuseEncoder, FuseDecoder
 from Models.KaolinRenderer import KaolinRenderer
+
 
 class CosyPoseStyleRenderMatch(nn.Module):
     def __init__(self, sensory_channels, renderer_config, num_candidates=32, use_learned_similarity=True, ngf=64):
         super().__init__()
         self.encoder = FuseEncoder(sensory_channels, ngf=ngf)
         self.decoder = FuseDecoder(ngf=ngf)
+        self.modalities = list(sensory_channels.keys())
+
         self.num_candidates = num_candidates
         self.use_learned_similarity = use_learned_similarity
+        self.render_weight = renderer_config.get("render_weight", 1.0)
 
-        self.renderer_config = renderer_config
         self.renderer = KaolinRenderer(
             image_size=renderer_config["image_size"],
             fov=renderer_config.get("fov", 60.0),
             device=renderer_config["device"]
         )
-        self.render_weight = renderer_config.get("render_weight", 1.0)
+
+        self.render_encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()  # (B, 64)
+        )
 
         self.sim_head = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
         )
 
     def extract_fused_features(self, x_dict):
-        x_latent, encoder_features = self.encoder(x_dict)
+        # Ensure only supported modalities are used
+        x_filtered = {k: v for k, v in x_dict.items() if k in self.modalities}
+        x_latent, encoder_features = self.encoder(x_filtered)
         fused_features = self.decoder(x_latent, encoder_features)
         return F.adaptive_avg_pool2d(fused_features, (1, 1)).view(fused_features.size(0), -1)
 
     def forward(self, x_dict, cad_model_data_list, candidate_pose_list, obj_instance_ids):
         results = []
-        for cad_model_data, candidate_poses, instance_ids in zip(
-            cad_model_data_list, candidate_pose_list, obj_instance_ids):
-
+        for cad_model_data, candidate_poses, instance_ids in zip(cad_model_data_list, candidate_pose_list, obj_instance_ids):
             verts, faces = cad_model_data
-            
             B, N = candidate_poses.shape[:2]
             device = candidate_poses.device
-            
+
+            # Batch verts and faces
             verts = verts.to(device)
             faces = faces.to(device)
-
             if verts.dim() == 2:
                 verts = verts.unsqueeze(0).repeat(B, 1, 1)
             if faces.dim() == 2:
                 faces = faces.unsqueeze(0).repeat(B, 1, 1)
 
+            # Extract real scene features
             scene_feat = self.extract_fused_features(x_dict)
 
             cad_feats = []
@@ -62,12 +73,14 @@ class CosyPoseStyleRenderMatch(nn.Module):
                 R = pose[:, :3, :3]
                 T = pose[:, :3, 3]
 
-                rendered_imgs = self.renderer(verts, faces, R, T)
-                rendered_dict = {"rgb": rendered_imgs.permute(0, 3, 1, 2)}
-                rendered_feat = self.extract_fused_features(rendered_dict)
+                # Render and extract features
+                rendered_imgs = self.renderer(verts, faces, R, T)  # (B, H, W, 3)
+                rendered_gray = rendered_imgs.mean(dim=-1, keepdim=True)  # (B, H, W, 1)
+                rendered_input = rendered_gray.permute(0, 3, 1, 2).float()  # (B, 1, H, W)
+                rendered_feat = self.render_encoder(rendered_input)  # (B, 256)
                 cad_feats.append(rendered_feat)
 
-            cad_feats = torch.stack(cad_feats, dim=1)
+            cad_feats = torch.stack(cad_feats, dim=1)  # (B, N, feat_dim)
             scene_feat_exp = scene_feat.unsqueeze(1).expand_as(cad_feats)
 
             if self.use_learned_similarity:
@@ -81,10 +94,12 @@ class CosyPoseStyleRenderMatch(nn.Module):
             R_best = best_pose[:, :3, :3]
             t_best = best_pose[:, :3, 3]
 
-            for i, inst_id in enumerate(instance_ids):
+            for i in range(sim_scores.size(0)):
+                idx = best_idx[i].item()
+                score = sim_scores[i, idx].item()
                 results.append({
-                    "obj_id": int(inst_id),
-                    "score": float(sim_scores[i, best_idx[i]].item()),
+                    "obj_id": int(instance_ids[i]),
+                    "score": float(score),
                     "cam_R_m2c": R_best[i].detach().cpu().numpy().tolist(),
                     "cam_t_m2c": (t_best[i] * 1000.0).detach().cpu().numpy().tolist()
                 })
@@ -99,7 +114,7 @@ class CosyPoseStyleRenderMatch(nn.Module):
         for cad_model_data, candidate_poses, R_gt, t_gt, instance_ids in zip(
                 cad_model_data_list, candidate_pose_list, R_gt_list, t_gt_list, instance_id_list):
 
-            preds = self.forward(x_dict, cad_model_data_list, candidate_pose_list, instance_id_list)
+            preds = self.forward(x_dict, [cad_model_data], [candidate_poses], [instance_ids])
             R_pred = torch.tensor([p["cam_R_m2c"] for p in preds], dtype=torch.float32, device=R_gt.device)
             t_pred = torch.tensor([p["cam_t_m2c"] for p in preds], dtype=torch.float32, device=t_gt.device) / 1000.0
 
@@ -112,6 +127,7 @@ class CosyPoseStyleRenderMatch(nn.Module):
             if faces.dim() == 2:
                 faces = faces.unsqueeze(0).repeat(R_gt.size(0), 1, 1)
 
+            # Render for ground truth and prediction
             mask_pred = self.renderer(verts, faces, R_pred, t_pred, K=K)
             mask_gt = self.renderer(verts, faces, R_gt, t_gt, K=K)
             render_loss = F.binary_cross_entropy_with_logits(mask_pred, mask_gt)

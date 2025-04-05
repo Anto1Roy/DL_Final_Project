@@ -65,4 +65,4 @@ class FuseEncoder(nn.Module):
 
         x = self.pools[4](x_fused)
         x = self.bridge(x)
-        return x, feats  # fused latent, skip connections
+        return x, feats 
