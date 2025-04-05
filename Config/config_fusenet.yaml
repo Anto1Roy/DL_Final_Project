@@ -1,9 +1,10 @@
 dataset:
-  remote_base_url: X:/ipd
+  remote_base_url: ipd_data/ipd
   cam_ids: [cam2]
   modality: [rgb, depth, aolp, dolp]
   train_split: train_pbr
   val_split: val
+  model_split: models
 
 training:
   batch_size: 1
@@ -20,3 +21,4 @@ optim:
 renderer:
   image_size: 256
   device: cuda
+  render_weight: 1.0

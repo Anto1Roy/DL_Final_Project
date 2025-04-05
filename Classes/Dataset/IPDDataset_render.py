@@ -47,20 +47,13 @@ class IPDDatasetMounted(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        scene_id, frame_id, obj_id, cam_id = self.samples[idx]
+        scene_id, frame_id, _, cam_id = self.samples[idx]
         fid = frame_id.zfill(6)
         fid_key = str(int(frame_id))
 
-        # model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-        # verts, faces = import_mesh(model_path)
-        model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-        mesh = trimesh.load(model_path, process=False)
-        verts = torch.tensor(mesh.vertices, dtype=torch.float32)  # ✅ No unsqueeze
-        faces = torch.tensor(mesh.faces, dtype=torch.long)        # ✅ No unsqueeze
-        cad_model_data = (verts, faces)  # ✅ Remove double unsqueeze
-
         base_remote = f"{self.split}/{scene_id}"
 
+        # --- Load image modalities ---
         input_modalities = []
         for modality in self.modalities:
             if modality == "rgb":
@@ -72,6 +65,7 @@ class IPDDatasetMounted(Dataset):
 
         x_dict = {modality: tensor for modality, tensor in zip(self.modalities, input_modalities)}
 
+        # --- Load camera intrinsics ---
         cam_idx = int(cam_id.replace("cam", ""))
         local_cam_json = self.file_manager.get(f"ipd/camera_cam{cam_idx}.json")
         with open(local_cam_json) as f:
@@ -81,7 +75,6 @@ class IPDDatasetMounted(Dataset):
         cx, cy = cam_cfg["cx"], cam_cfg["cy"]
         W_orig, H_orig = cam_cfg["width"], cam_cfg["height"]
         W_new, H_new = self.img_size
-
         scale_x = W_new / W_orig
         scale_y = H_new / H_orig
 
@@ -92,16 +85,45 @@ class IPDDatasetMounted(Dataset):
         ], dtype=np.float32)
         K = torch.tensor(K, dtype=torch.float32)
 
+        # --- Load all instances in the image ---
         local_gt_json = self.file_manager.get(f"{base_remote}/scene_gt_{cam_id}.json")
         with open(local_gt_json) as f:
-            gt = json.load(f)[fid_key][0]
+            gt_all = json.load(f)[fid_key]
 
-        R = torch.tensor(gt["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
-        t = torch.tensor(gt["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
+        R_gt_list = []
+        t_gt_list = []
+        cad_model_data_list = []
+        candidate_pose_list = []
+        instance_id_list = []
 
-        candidate_poses = torch.eye(4).repeat(1, 1, 1)
+        for obj in gt_all:
+            obj_id = obj["obj_id"]
+            R = torch.tensor(obj["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
+            t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
+            R_gt_list.append(R)
+            t_gt_list.append(t)
 
-        return x_dict, R, t, K, cad_model_data, candidate_poses
+            # Load CAD model
+            model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+            mesh = trimesh.load(model_path, process=False)
+            verts = torch.tensor(mesh.vertices, dtype=torch.float32)
+            faces = torch.tensor(mesh.faces, dtype=torch.long)
+            cad_model_data_list.append((verts, faces))
+
+            # Candidate poses (identity for now — TODO: sample real candidates)
+            candidate_pose_list.append(torch.eye(4).unsqueeze(0))
+            instance_id_list.append(obj_id)
+
+        return (
+            x_dict,
+            R_gt_list,
+            t_gt_list,
+            K,
+            cad_model_data_list,
+            candidate_pose_list,
+            [instance_id_list]
+        )
+
 
     def read_img(self, remote_path, modality):
         local_path = self.file_manager.get(remote_path)

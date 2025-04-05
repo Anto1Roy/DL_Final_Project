@@ -15,7 +15,7 @@ class FuseDecoder(nn.Module):
         super().__init__()
         act_fn = act_fn or nn.ReLU()
         self.deconv = nn.ModuleList([
-            conv_trans_block(ngf * 16, ngf * 16, act_fn),
+            conv_trans_block(ngf * 32, ngf * 16, act_fn),
             conv_trans_block(ngf * 16, ngf * 8, act_fn),
             conv_trans_block(ngf * 8, ngf * 4, act_fn),
             conv_trans_block(ngf * 4, ngf * 2, act_fn),

@@ -108,6 +108,10 @@ def main():
 
     rot_losses = []
     trans_losses = []
+    render_losses = []
+    rot_losses_val = []
+    trans_losses_val = []
+    render_losses_val = []
     avg_train_losses = []
     avg_valid_losses = []
 
@@ -124,20 +128,36 @@ def main():
         for batch in train_loader:
             if batch is None:
                 continue
-            (x_dict, R_gt, t_gt, K, cad_model, candidate_poses) = batch
+            (
+                x_dict,
+            R_gt_list,
+            t_gt_list,
+            K,
+            cad_model_data_list,
+            candidate_pose_list,
+            instance_id_list,
+            ) = batch
 
-            x_dict = {modality: Variable(x).to(device) for modality, x in x_dict.items()}
-            R_gt = Variable(R_gt).to(device)
-            t_gt = Variable(t_gt).to(device)
-            # cad_model = cad_model.to(device)
-            candidate_poses = candidate_poses.to(device)
+            x_dict = {
+                modality: Variable(x).to(device)
+                for modality, x in x_dict.items()
+            }
+            R_gt_list = [Variable(R).to(device) for R in R_gt_list]
+            t_gt_list = [Variable(t).to(device) for t in t_gt_list]
+            candidate_pose_list = [p.to(device) for p in candidate_pose_list]
+            cad_model_data_list = [
+                (verts.to(device), faces.to(device)) for (verts, faces) in cad_model_data_list
+            ]
 
             optimizer.zero_grad()
             with autocast():
-                R_pred, t_pred = model(x_dict, cad_model, candidate_poses)
-                rot_loss = F.mse_loss(R_pred, R_gt)
-                trans_loss = F.mse_loss(t_pred, t_gt)
-                loss = rot_loss + trans_loss
+                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
+                    x_dict, cad_model_data_list, candidate_pose_list, R_gt_list, t_gt_list, instance_id_list, K=K
+                )
+
+            rot_losses.append(rot_loss.item())
+            trans_losses.append(trans_loss.item())
+            render_losses.append(render_loss.item())
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -153,23 +173,39 @@ def main():
         valid_loss = 0.0
         with torch.no_grad():
             for batch in valid_loader:
-                (x_dict, R_gt, t_gt, K, cad_model, candidate_poses) = batch
+                if batch is None:
+                    continue
+                (
+                    x_dict,
+                    R_gt_list,
+                    t_gt_list,
+                    K,
+                    cad_model_data_list,
+                    candidate_pose_list,
+                    instance_id_list,
+                ) = batch
 
-                x_dict = {modality: x.to(device) for modality, x in x_dict.items()}
-                R_gt = R_gt.to(device)
-                t_gt = t_gt.to(device)
-                # cad_model = cad_model.to(device)
-                candidate_poses = candidate_poses.to(device)
+                x_dict = {
+                    modality: x.to(device) for modality, x in x_dict.items()
+                }
+                R_gt_list = [R.to(device) for R in R_gt_list]
+                t_gt_list = [t.to(device) for t in t_gt_list]
+                candidate_pose_list = [p.to(device) for p in candidate_pose_list]
+                cad_model_data_list = [
+                    (verts.to(device), faces.to(device)) for (verts, faces) in cad_model_data_list
+                ]
 
-                R_pred, t_pred = model(x_dict, cad_model, candidate_poses)
-                rot_loss = F.mse_loss(R_pred, R_gt)
-                trans_loss = F.mse_loss(t_pred, t_gt)
-                loss = rot_loss + trans_loss
+                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
+                    x_dict, cad_model_data_list, candidate_pose_list, R_gt_list, t_gt_list, instance_id_list, K=K
+                )
 
+                rot_losses_val.append(rot_loss)
+                trans_losses_val.append(trans_loss)
+                render_losses_val.append(render_loss)
                 valid_loss += loss.item()
 
-        avg_valid_loss = valid_loss / len(valid_loader)
-        avg_valid_losses.append(avg_valid_loss)
+                avg_valid_loss = valid_loss / len(valid_loader)
+                avg_valid_losses.append(avg_valid_loss)
 
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
 
