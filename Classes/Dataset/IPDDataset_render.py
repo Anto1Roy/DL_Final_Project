@@ -64,7 +64,7 @@ class IPDDatasetMounted(Dataset):
         input_modalities = []
         for modality in self.modalities:
             if modality == "rgb":
-                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
+                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.jpg"
             else:
                 remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
             img = self.read_img(remote_path, modality)

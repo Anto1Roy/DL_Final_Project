@@ -40,10 +40,11 @@ class FuseEncoder(nn.Module):
                 Conv_residual_conv(ngf, ngf * 2, self.act_fn),
                 Conv_residual_conv(ngf * 2, ngf * 4, self.act_fn),
                 Conv_residual_conv(ngf * 4, ngf * 8, self.act_fn),
-                Conv_residual_conv(ngf * 8, ngf * 16, self.act_fn)
+                Conv_residual_conv(ngf * 8, ngf * 16, self.act_fn),
+                Conv_residual_conv(ngf * 16, ngf * 32, act_fn),  # new! add 5th block
             ])
         self.pools = nn.ModuleList([maxpool() for _ in range(5)])
-        self.bridge = Conv_residual_conv(ngf * 16, ngf * 32, self.act_fn)
+        self.bridge = Conv_residual_conv(ngf * 32, ngf * 32, self.act_fn)
 
     def forward(self, x_dict):
         feats = []

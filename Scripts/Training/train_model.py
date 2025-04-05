@@ -15,7 +15,7 @@ import numpy as np
 
 # --- Local Import ---
 sys.path.append(os.getcwd())
-from Models.RenderMatchPoseNet import RenderMatchPoseNet
+from Models.PoseEstimator import CosyPoseStyleRenderMatch  
 from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Classes.EarlyStopping import EarlyStopping
 
@@ -44,7 +44,8 @@ def main():
     remote_base_url = config["dataset"]["remote_base_url"]
     cam_ids = config["dataset"]["cam_ids"]
     modalities = config["dataset"].get("modality", ["rgb", "depth"])
-    split = config["dataset"].get("split", "val")
+    train_split = config["dataset"].get("train_split", "train_pbr")
+    val_split = config["dataset"].get("val_split", "val")
     batch_size = int(config["training"]["batch_size"])
     epochs = int(config["training"]["epochs"])
     num_workers = int(config["training"]["num_workers"])
@@ -60,7 +61,9 @@ def main():
     print(f"Remote Base URL: {remote_base_url}")
     print(f"Cam IDs: {cam_ids}")
     print(f"Modalities: {modalities}")
-    print(f"Split: {split}")
+    print(f"Train Split: {train_split}")
+    print(f"Validation Split: {val_split}")
+    print(f"Renderer Config: {renderer_config}")
     print(f"Batch Size: {batch_size}")
     print(f"Epochs: {epochs}")
     print(f"Num Workers: {num_workers}")
@@ -75,7 +78,7 @@ def main():
         remote_base_url=remote_base_url,
         cam_ids=cam_ids,
         modalities=modalities,
-        split=split,
+        split=train_split,
         models_dir=os.path.join(remote_base_url, "models")
     )
 
@@ -94,7 +97,7 @@ def main():
 
     # --- Model ---
     sensory_channels = {mod: 1 for mod in modalities}
-    model = RenderMatchPoseNet(sensory_channels, renderer_config).to(device)
+    model = CosyPoseStyleRenderMatch(sensory_channels, renderer_config).to(device)
     file_path = f"./weights/rendermatch_pose_{len(modalities)}y.pth"
     checkpoint_path = f"./checkpoints/rendermatch_checkpoint_{len(modalities)}y.pth"
 
@@ -109,6 +112,8 @@ def main():
     avg_valid_losses = []
 
     start_epoch, epoch_seed = load_checkpoint(checkpoint_path, model, optimizer, scaler, scheduler)
+
+    print("\n------Training------")
 
     for epoch in range(start_epoch, epochs):
         model.train()

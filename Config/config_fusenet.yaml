@@ -1,8 +1,9 @@
 dataset:
-  remote_base_url: ipd_data/ipd
+  remote_base_url: X:/ipd
   cam_ids: [cam2]
   modality: [rgb, depth, aolp, dolp]
-  split: val
+  train_split: train_pbr
+  val_split: val
 
 training:
   batch_size: 1
