@@ -1,12 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.utils as utils
-import torch.nn.init as init
-import torch.utils.data as data
-import torchvision.utils as v_utils
-import torchvision.datasets as dset
-import torchvision.transforms as transforms
-from torch.autograd import Variable
+from scipy.spatial.transform import Rotation
 
 
 def conv_block(in_dim, out_dim, act_fn):
@@ -42,16 +36,20 @@ def conv_block_3(in_dim,out_dim,act_fn):
     return model
 
 def quaternion_to_matrix(q):
-        B = q.shape[0]
-        qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-        R = torch.zeros((B, 3, 3), device=q.device)
-        R[:, 0, 0] = 1 - 2 * (qy ** 2 + qz ** 2)
-        R[:, 0, 1] = 2 * (qx * qy - qz * qw)
-        R[:, 0, 2] = 2 * (qx * qz + qy * qw)
-        R[:, 1, 0] = 2 * (qx * qy + qz * qw)
-        R[:, 1, 1] = 1 - 2 * (qx ** 2 + qz ** 2)
-        R[:, 1, 2] = 2 * (qy * qz - qx * qw)
-        R[:, 2, 0] = 2 * (qx * qz - qy * qw)
-        R[:, 2, 1] = 2 * (qy * qz + qx * qw)
-        R[:, 2, 2] = 1 - 2 * (qx ** 2 + qy ** 2)
-        return R
+    B = q.shape[0]
+    qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    R = torch.zeros((B, 3, 3), device=q.device)
+    R[:, 0, 0] = 1 - 2 * (qy ** 2 + qz ** 2)
+    R[:, 0, 1] = 2 * (qx * qy - qz * qw)
+    R[:, 0, 2] = 2 * (qx * qz + qy * qw)
+    R[:, 1, 0] = 2 * (qx * qy + qz * qw)
+    R[:, 1, 1] = 1 - 2 * (qx ** 2 + qz ** 2)
+    R[:, 1, 2] = 2 * (qy * qz - qx * qw)
+    R[:, 2, 0] = 2 * (qx * qz - qy * qw)
+    R[:, 2, 1] = 2 * (qy * qz + qx * qw)
+    R[:, 2, 2] = 1 - 2 * (qx ** 2 + qy ** 2)
+    return R
+
+def rotation_to_quat(R):
+    q = Rotation.from_matrix(R.cpu().numpy()).as_quat()
+    return torch.tensor(q, dtype=torch.float32, device=R.device)

@@ -26,7 +26,7 @@ class FuseNetPoseModel(nn.Module):
             nn.Linear(fc_width // 2, 7)
         )
 
-    def forward(self, x_dict, R_gt=None, t_gt=None):
+    def forward(self, x_dict):
         x, feats = self.encoder(x_dict)
         x = self.decoder(x, feats)
 
@@ -35,9 +35,4 @@ class FuseNetPoseModel(nn.Module):
 
         quat = F.normalize(pose[:, :4], dim=1)
         trans = pose[:, 4:]
-
-        if R_gt is not None and t_gt is not None:
-            rot_loss = F.mse_loss(quaternion_to_matrix(quat), R_gt)
-            trans_loss = F.mse_loss(trans, t_gt)
-            return quat, trans, rot_loss, trans_loss
         return quat, trans

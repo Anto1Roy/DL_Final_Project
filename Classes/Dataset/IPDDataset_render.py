@@ -93,7 +93,6 @@ class IPDDatasetMounted(Dataset):
         R_gt_list = []
         t_gt_list = []
         cad_model_data_list = []
-        candidate_pose_list = []
         instance_id_list = []
 
         for obj in gt_all:
@@ -110,8 +109,6 @@ class IPDDatasetMounted(Dataset):
             faces = torch.tensor(mesh.faces, dtype=torch.long)
             cad_model_data_list.append((verts, faces))
 
-            # Candidate poses (identity for now — TODO: sample real candidates)
-            candidate_pose_list.append(torch.eye(4).unsqueeze(0))
             instance_id_list.append(obj_id)
 
         return (
@@ -120,9 +117,9 @@ class IPDDatasetMounted(Dataset):
             t_gt_list,
             K,
             cad_model_data_list,
-            candidate_pose_list,
             [instance_id_list]
         )
+
 
 
     def read_img(self, remote_path, modality):

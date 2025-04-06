@@ -14,8 +14,7 @@ training:
   patience: 10
 
 optim:
-  lr_rot: 1e-5
-  lr_trans: 1e-4
+  lr: 1e-4
   weight_decay: 0.0
 
 renderer:
