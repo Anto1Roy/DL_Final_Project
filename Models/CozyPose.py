@@ -35,19 +35,21 @@ class CosyPoseStyleRenderMatch(nn.Module):
         results = []
         all_best_R = []
         all_best_t = []
-
-        for i in range(len(candidate_poses_list)):
+        for i in range(len(cad_models)):
             feat_map = F.adaptive_avg_pool2d(feat_maps[i], (1, 1)).view(1, -1)  # (1, F)
             verts, faces = cad_models[i]
             candidate_poses = candidate_poses_list[i]  # (N, 4, 4)
             obj_id = instance_ids[i]
             K = K_list[i] if K_list is not None else None
 
+            B, N = 1, candidate_poses.shape[0]
+            device = candidate_poses.device
+
             verts = verts.unsqueeze(0) if verts.dim() == 2 else verts
             faces = faces.unsqueeze(0) if faces.dim() == 2 else faces
 
             cad_feats = []
-            for n in range(candidate_poses.shape[0]):
+            for n in range(N):
                 pose = candidate_poses[n].unsqueeze(0)  # (1, 4, 4)
                 R = pose[:, :3, :3]
                 T = pose[:, :3, 3]
@@ -84,12 +86,14 @@ class CosyPoseStyleRenderMatch(nn.Module):
 
         return results, R_tensor, t_tensor
 
+
     def compute_losses(self, feat_maps, cad_model_data_list, candidate_pose_list,
-                       R_gt_list, t_gt_list, instance_id_list, K_list=None):
-        device = feat_maps[0].device
+                   R_gt_list, t_gt_list, instance_id_list, K_list=None):
+        device = feat_maps[0].device 
         R_gt_tensor = torch.stack(R_gt_list).to(device)
         t_gt_tensor = torch.stack(t_gt_list).to(device)
 
+        # Forward pass to get the predicted poses
         _, R_pred, t_pred = self.forward(
             feat_maps,
             cad_model_data_list,
@@ -98,31 +102,41 @@ class CosyPoseStyleRenderMatch(nn.Module):
             K_list=K_list
         )
 
+        # Rotation and Translation Losses
         rot_loss = F.mse_loss(R_pred, R_gt_tensor)
         trans_loss = F.mse_loss(t_pred, t_gt_tensor)
 
+        # Render losses for each sample
         render_losses = []
         for i in range(len(R_gt_list)):
             verts, faces = cad_model_data_list[i]
 
-            verts = verts.unsqueeze(0) # (1, V, 3)
-            faces = faces.unsqueeze(0) # (1, F, 3)
+            verts = verts.unsqueeze(0)  # (1, V, 3)
+            faces = faces.unsqueeze(0)  # (1, F, 3)
 
+            # Extract predicted and ground truth poses for each object
             R_pred_i = R_pred[i].unsqueeze(0)
             t_pred_i = t_pred[i].unsqueeze(0)
             R_gt_i = R_gt_tensor[i].unsqueeze(0)
             t_gt_i = t_gt_tensor[i].unsqueeze(0)
-            K_i = K_list[i].unsqueeze(0)
+            K_i = K_list[i].unsqueeze(0) if K_list is not None else None
 
+            # Render the predicted and ground truth masks
             mask_pred = self.renderer(verts, faces, R_pred_i, t_pred_i, K=K_i)
             mask_gt = self.renderer(verts, faces, R_gt_i, t_gt_i, K=K_i)
+
+            # Compute binary cross-entropy loss between predicted and ground truth masks
             render_loss = F.binary_cross_entropy_with_logits(mask_pred, mask_gt)
             render_losses.append(render_loss)
 
+        # Average render loss
         avg_render_loss = torch.stack(render_losses).mean()
 
+        # If render loss is NaN or Inf, skip rendering loss and calculate only the rotation and translation loss
         if torch.isnan(avg_render_loss) or torch.isinf(avg_render_loss):
             total_loss = rot_loss + trans_loss
         else:
+            # Total loss includes rotation, translation, and weighted render loss
             total_loss = rot_loss + trans_loss + self.render_weight * avg_render_loss
+
         return total_loss, rot_loss, trans_loss, avg_render_loss

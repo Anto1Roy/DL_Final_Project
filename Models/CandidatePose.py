@@ -7,7 +7,7 @@ from Models.ObjectDetection.CosyPose_Encoder import CosyPoseDetectionHead
 
 
 class CandidatePoseModel(nn.Module):
-    def __init__(self, feature_dim):
+    def __init__(self, feature_dim=64):
         super().__init__()
         self.det_head = CosyPoseDetectionHead(feature_dim)
 
