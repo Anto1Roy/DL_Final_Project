@@ -6,7 +6,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-# from kaolin.io.obj import import_mesh
 import trimesh
 
 # --- Local Import ---
@@ -14,7 +13,7 @@ sys.path.append(os.getcwd())
 from Classes.Dataset.StreamingFileManager import StreamingFileManager
 
 class IPDDatasetMounted(Dataset):
-    def __init__(self, remote_base_url, cam_ids, modalities=["rgb", "depth"], split="val", transform=None, models_dir=None):
+    def __init__(self, remote_base_url, cam_ids, modalities=["rgb", "depth"], split="val", transform=None, models_dir=None, allowed_obj_ids=None, allowed_scene_ids=None):
         self.img_size = (640, 480)
         self.file_manager = StreamingFileManager(remote_base_url)
         self.cam_ids = cam_ids
@@ -26,21 +25,28 @@ class IPDDatasetMounted(Dataset):
             transforms.ToTensor()
         ])
         self.remote_base = os.path.expanduser(remote_base_url)
+        self.allowed_obj_ids = set(allowed_obj_ids) if allowed_obj_ids is not None else None
+        self.allowed_scene_ids = set(allowed_scene_ids) if allowed_scene_ids is not None else None
         self.samples = self._load_index()
         self.models_dir = models_dir or os.path.join(remote_base_url, "models")
 
     def _load_index(self):
         samples = []
-        for scene_id in sorted(os.listdir(os.path.join(self.remote_base, self.split))):
+        scene_dir = os.path.join(self.remote_base, self.split)
+        for scene_id in sorted(os.listdir(scene_dir)):
+            if self.allowed_scene_ids is not None and scene_id not in self.allowed_scene_ids:
+                continue
+
             for cam_id in self.cam_ids:
-                local_path = os.path.join(self.remote_base, self.split, scene_id, f"scene_gt_{cam_id}.json")
+                local_path = os.path.join(scene_dir, scene_id, f"scene_gt_{cam_id}.json")
                 if not os.path.exists(local_path):
                     continue
                 with open(local_path) as f:
                     gt_data = json.load(f)
                 for frame_id, objects in gt_data.items():
                     for obj in objects:
-                        samples.append((scene_id, frame_id, obj["obj_id"], cam_id))
+                        if self.allowed_obj_ids is None or obj["obj_id"] in self.allowed_obj_ids:
+                            samples.append((scene_id, frame_id, obj["obj_id"], cam_id))
         return samples
 
     def __len__(self):
@@ -50,22 +56,23 @@ class IPDDatasetMounted(Dataset):
         scene_id, frame_id, _, cam_id = self.samples[idx]
         fid = frame_id.zfill(6)
         fid_key = str(int(frame_id))
-
         base_remote = f"{self.split}/{scene_id}"
 
-        # --- Load image modalities ---
         input_modalities = []
         for modality in self.modalities:
             if modality == "rgb":
                 remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.jpg"
             else:
                 remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
-            img = self.read_img(remote_path, modality)
-            input_modalities.append(img)
+            try:
+                img = self.read_img(remote_path, modality)
+                input_modalities.append(img)
+            except Exception as e:
+                print(f"[WARN] Skipping sample {idx} due to missing {modality} ({e})")
+                return None
 
         x_dict = {modality: tensor for modality, tensor in zip(self.modalities, input_modalities)}
 
-        # --- Load camera intrinsics ---
         cam_idx = int(cam_id.replace("cam", ""))
         local_cam_json = self.file_manager.get(f"ipd/camera_cam{cam_idx}.json")
         with open(local_cam_json) as f:
@@ -85,42 +92,33 @@ class IPDDatasetMounted(Dataset):
         ], dtype=np.float32)
         K = torch.tensor(K, dtype=torch.float32)
 
-        # --- Load all instances in the image ---
         local_gt_json = self.file_manager.get(f"{base_remote}/scene_gt_{cam_id}.json")
         with open(local_gt_json) as f:
             gt_all = json.load(f)[fid_key]
 
-        R_gt_list = []
-        t_gt_list = []
-        cad_model_data_list = []
-        instance_id_list = []
+        R_gt = []
+        t_gt = []
+        instance_ids = []
+        verts_all = []
+        faces_all = []
 
         for obj in gt_all:
             obj_id = obj["obj_id"]
             R = torch.tensor(obj["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
             t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
-            R_gt_list.append(R)
-            t_gt_list.append(t)
+            R_gt.append(R)
+            t_gt.append(t)
 
-            # Load CAD model
             model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
             mesh = trimesh.load(model_path, process=False)
             verts = torch.tensor(mesh.vertices, dtype=torch.float32)
             faces = torch.tensor(mesh.faces, dtype=torch.long)
-            cad_model_data_list.append((verts, faces))
+            verts_all.append(verts)
+            faces_all.append(faces)
 
-            instance_id_list.append(obj_id)
+            instance_ids.append(obj_id)
 
-        return (
-            x_dict,
-            R_gt_list,
-            t_gt_list,
-            K,
-            cad_model_data_list,
-            [instance_id_list]
-        )
-
-
+        return x_dict, K, R_gt, t_gt, instance_ids, list(zip(verts_all, faces_all))
 
     def read_img(self, remote_path, modality):
         local_path = self.file_manager.get(remote_path)
@@ -138,5 +136,4 @@ class IPDDatasetMounted(Dataset):
                 raise FileNotFoundError(f"{modality.upper()} image not found at {remote_path}")
             norm = 65535.0 if modality == "depth" else 255.0
             tensor = self.transform((img.astype(np.float32) / norm)[:, :, None])
-
         return tensor

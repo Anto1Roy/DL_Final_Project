@@ -9,21 +9,6 @@ import os
 sys.path.append(os.getcwd())
 from Models.helpers import *
 
-class Conv_residual_conv(nn.Module):
-    def __init__(self, in_dim, out_dim, act_fn):
-        super().__init__()
-        self.conv_1 = conv_block(in_dim, out_dim, act_fn)
-        self.conv_2 = conv_block_3(out_dim, out_dim, act_fn)
-        self.conv_3 = conv_block(out_dim, out_dim, act_fn)
-
-    def forward(self, x):
-        conv_1 = self.conv_1(x)
-        conv_2 = self.conv_2(conv_1)
-        res = conv_1 + conv_2
-        conv_3 = self.conv_3(res)
-        return conv_3
-
-
 class FuseEncoder(nn.Module):
     def __init__(self, sensory_channels, ngf=64, act_fn=None):
         super().__init__()

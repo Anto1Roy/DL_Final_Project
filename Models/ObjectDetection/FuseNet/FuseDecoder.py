@@ -7,7 +7,6 @@ import os
 
 # --- Local Import ---
 sys.path.append(os.getcwd())
-from Models.FuseEncoder import Conv_residual_conv
 from Models.helpers import *
 
 class FuseDecoder(nn.Module):

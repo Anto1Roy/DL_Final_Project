@@ -7,21 +7,16 @@ from kaolin.render.mesh import rasterize
 
 
 class KaolinRenderer(nn.Module):
-    def __init__(self, image_size=256, fov=60.0, device='cuda'):
+    def __init__(self, width=640, height=480, fov=60.0, device='cuda'):
         super().__init__()
-        self.image_size = image_size
+        self.width = width
+        self.height = height
         self.fov = fov
         self.device = device
 
     def forward(self, verts, faces, R, T, K=None):
         B = R.shape[0]
         images = []
-
-        # Ensure verts and faces are batched
-        # if verts.dim() == 2:
-        #     verts = verts.unsqueeze(0).repeat(B, 1, 1)
-        # if faces.dim() == 2:
-        #     faces = faces.unsqueeze(0).repeat(B, 1, 1)
 
         for b in range(B):
             cam_rot = R[b]
@@ -47,21 +42,21 @@ class KaolinRenderer(nn.Module):
             verts_homo = torch.cat([verts_b, ones], dim=-1)  # (V, 4)
             verts_cam = verts_homo @ VP.T  # (V, 4)
             verts_ndc = verts_cam[:, :3] / verts_cam[:, 3:].clamp(min=1e-8)  # (V, 3)
+            verts_ndc = torch.nan_to_num(verts_ndc, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Gather face vertices for rasterization
             face_vertices_image = verts_ndc[face_b][:, :, :2]  # (F, 3, 2)
             face_vertices_z = verts_ndc[face_b][:, :, 2]       # (F, 3)
 
-            face_features = torch.ones((face_b.shape[0], 3, 1), device=self.device, dtype=torch.float32)
-
             # Add batch dimension and cast to float32 for AMP compatibility
             face_vertices_image = face_vertices_image.unsqueeze(0).to(self.device).float()  # (1, F, 3, 2)
             face_vertices_z = face_vertices_z.unsqueeze(0).to(self.device).float()          # (1, F, 3)
-            face_features = face_features.float()                                           # (1, F, 3)
+            face_features = torch.ones((face_b.shape[0], 3, 1), device=self.device, dtype=torch.float32)
+            face_features = face_features.unsqueeze(0)   # (1, F, 3, 1)
 
             rast_out, _ = rasterize(
-                height=self.image_size,
-                width=self.image_size,
+                height=self.height,
+                width=self.width,
                 face_vertices_image=face_vertices_image,
                 face_vertices_z=face_vertices_z,
                 face_features=face_features
@@ -86,7 +81,7 @@ class KaolinRenderer(nn.Module):
     def build_projection_from_K(self, K):
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
-        w, h = self.image_size, self.image_size
+        w, h = self.width, self.height
 
         proj = torch.tensor([
             [2 * fx / w, 0,          (w - 2 * cx) / w, 0],

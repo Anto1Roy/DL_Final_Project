@@ -53,3 +53,17 @@ def quaternion_to_matrix(q):
 def rotation_to_quat(R):
     q = Rotation.from_matrix(R.cpu().numpy()).as_quat()
     return torch.tensor(q, dtype=torch.float32, device=R.device)
+
+class Conv_residual_conv(nn.Module):
+    def __init__(self, in_dim, out_dim, act_fn):
+        super().__init__()
+        self.conv_1 = conv_block(in_dim, out_dim, act_fn)
+        self.conv_2 = conv_block_3(out_dim, out_dim, act_fn)
+        self.conv_3 = conv_block(out_dim, out_dim, act_fn)
+
+    def forward(self, x):
+        conv_1 = self.conv_1(x)
+        conv_2 = self.conv_2(conv_1)
+        res = conv_1 + conv_2
+        conv_3 = self.conv_3(res)
+        return conv_3

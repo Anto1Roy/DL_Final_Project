@@ -2,20 +2,38 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Models.CozyPose import CosyPoseStyleRenderMatch
+from Models.ObjectDetection.FuseNet.FuseNet import FuseNetFeatureEncoder
+from Models.ObjectDetection.ResNet import ResNetFeatureEncoder
+from Models.ObjectDetection.GridObjectDetector import GridObjectDetector
 from Models.CandidatePose import CandidatePoseModel
-from Models.helpers import quaternion_to_matrix, rotation_to_quat
+from Models.CozyPose import CosyPoseStyleRenderMatch
+from Models.helpers import quaternion_to_matrix
 
 class TwoStagePoseEstimator(nn.Module):
-    def __init__(self, sensory_channels, renderer_config, num_candidates=32, noise_level=0.05):
+    def __init__(self, sensory_channels, renderer_config, encoder_type="resnet", num_candidates=32, noise_level=0.05, conf_thresh=0.5):
         super().__init__()
         self.num_candidates = num_candidates
         self.noise_level = noise_level
-        self.base_model = CandidatePoseModel(sensory_channels)
-        self.refiner = CosyPoseStyleRenderMatch(sensory_channels, renderer_config, num_candidates=num_candidates)
+        self.conf_thresh = conf_thresh
 
-    def detect(self, x_dict, top_k=10):
-        return self.base_model.decode_poses(self.base_model(x_dict), top_k=top_k)
+        if encoder_type == "resnet":
+            self.encoder = ResNetFeatureEncoder(modality="rgb", out_dim=64)
+        elif encoder_type == "fusenet":
+            self.encoder = FuseNetFeatureEncoder(sensory_channels, ngf=64)
+
+        self.det_head = CandidatePoseModel(feature_dim=self.encoder.out_dim)
+        self.refiner = CosyPoseStyleRenderMatch(
+            renderer_config,
+            num_candidates=num_candidates
+        )
+
+    def extract_features(self, x_dict):
+        return self.encoder(x_dict)
+
+    def detect(self, feat_map, top_k=15):
+        outputs = self.det_head.forward(feat_map)
+        detections = self.det_head.decode_poses(outputs, top_k=top_k)
+        return [d for d in detections if d["score"] >= self.conf_thresh], outputs
 
     def sample_candidates(self, detections):
         candidates_all = []
@@ -30,70 +48,99 @@ class TwoStagePoseEstimator(nn.Module):
             poses = torch.eye(4, device=quat.device).repeat(self.num_candidates, 1, 1)
             poses[:, :3, :3] = R
             poses[:, :3, 3] = noisy_t
-            candidates_all.append((det["obj_id"], poses))
+            candidates_all.append(poses)
         return candidates_all
 
-    def score_candidates(self, x_dict, K, candidates_all, cad_model_lookup):
-        pose_inputs = []
-        obj_ids = []
-        for obj_id, poses in candidates_all:
-            pose_inputs.append(poses.unsqueeze(0))
-            obj_ids.append(obj_id)
+    def score_candidates(self, feat_map, K, candidates_all, cad_model_lookup):
+        all_results = []
+        for obj_id, (cad_data, poses) in cad_model_lookup.items():
+            scores = self.refiner(
+                feat_map=feat_map,
+                cad_model_data_list=[cad_data],
+                candidate_pose_list=[poses],
+                instance_id_list=[obj_id],
+                K=K
+            )
+            all_results.extend(scores)
+        return all_results
 
-        cad_model_data_list = [cad_model_lookup[obj_id] for obj_id in obj_ids]
-        instance_id_list = [obj_ids]  # batch size = 1
-        return self.refiner(x_dict, cad_model_data_list, pose_inputs, instance_id_list)
+    def forward(self, x):
+        features = self.feature_encoder(x)
+        detections = self.object_detector(features)
+        return detections
 
-    def forward(self, x_dict, K, cad_model_lookup, top_k=10):
-        detections = self.detect(x_dict, top_k=top_k)
-        candidates_all = self.sample_candidates(detections)
-        results = self.score_candidates(x_dict, K, candidates_all, cad_model_lookup)
-        return results
+    def compute_losses(self, x_dict_batch, K_batch, cad_model_lookup, R_gt_batch, t_gt_batch, instance_ids_batch):
+        feat_maps = self.encoder(x_dict_batch)
 
-    def compute_losses(self, x_dict, K, cad_model_lookup,
-                       R_gt_list, t_gt_list, instance_id_list):
+        all_scene_feats = []
+        all_cad_data = []
+        all_candidate_poses = []
+        all_instance_ids = []
+        all_R_gt = []
+        all_t_gt = []
 
-        yolo_output = self.base_model(x_dict)
-        detections = self.base_model.decode_poses(yolo_output, top_k=len(instance_id_list))
+        for i in range(len(feat_maps)):
+            feat_map = feat_maps[i]
+            K = K_batch[i]
+            R_gt_list = R_gt_batch[i]
+            t_gt_list = t_gt_batch[i]
+            inst_ids = instance_ids_batch[i]
+            cad_models = []
+            poses = []
+            R_gt = []
+            t_gt = []
+            instance_ids = []
 
-        candidates_all = []
-        for det in detections:
-            obj_id = det["obj_id"]
-            if obj_id not in instance_id_list:
-                continue
-            quat = det["quat"].unsqueeze(0).expand(self.num_candidates, -1)
-            trans = det["trans"].unsqueeze(0).expand(self.num_candidates, -1)
+            for j, obj_id in enumerate(inst_ids):
+                if obj_id not in cad_model_lookup:
+                    continue
+                verts, faces = cad_model_lookup[obj_id]
+                quat = torch.randn(self.num_candidates, 4, device=feat_map.device)
+                quat = F.normalize(quat, dim=-1)
+                trans = torch.randn(self.num_candidates, 3, device=feat_map.device) * 0.05
+                R = quaternion_to_matrix(quat)
+                pose = torch.eye(4, device=feat_map.device).repeat(self.num_candidates, 1, 1)
+                pose[:, :3, :3] = R
+                pose[:, :3, 3] = trans
+                cad_models.append((verts, faces))
+                poses.append(pose)
+                R_gt.append(R_gt_list[j])
+                t_gt.append(t_gt_list[j])
+                instance_ids.append(obj_id)
 
-            noise_q = torch.randn_like(quat) * self.noise_level
-            noise_t = torch.randn_like(trans) * self.noise_level
+            if poses:
+                all_scene_feats.append(feat_map)
+                all_cad_data.append(cad_models)
+                all_candidate_poses.append(poses)
+                all_instance_ids.append(instance_ids)
+                all_R_gt.append(R_gt)
+                all_t_gt.append(t_gt)
 
-            noisy_q = F.normalize(quat + noise_q, dim=-1)
-            noisy_t = trans + noise_t
-
-            R = quaternion_to_matrix(noisy_q)
-            poses = torch.eye(4, device=quat.device).repeat(self.num_candidates, 1, 1)
-            poses[:, :3, :3] = R
-            poses[:, :3, 3] = noisy_t
-
-            candidates_all.append((obj_id, poses))
-
-        cad_model_data_list = [cad_model_lookup[obj_id] for obj_id, _ in candidates_all]
-        candidate_pose_list = [poses for _, poses in candidates_all]
-        matched_ids = [obj_id for obj_id, _ in candidates_all]
-
-        gt_R_list = []
-        gt_t_list = []
-        for obj_id in matched_ids:
-            idx = instance_id_list.index(obj_id)
-            gt_R_list.append(R_gt_list[idx])
-            gt_t_list.append(t_gt_list[idx])
+        if len(all_scene_feats) == 0:
+            zero = torch.tensor(0.0, requires_grad=True, device=feat_maps[0].device)
+            return zero, zero, zero, zero
 
         return self.refiner.compute_losses(
-            x_dict,
-            cad_model_data_list=cad_model_data_list,
-            candidate_pose_list=candidate_pose_list,
-            R_gt_list=gt_R_list,
-            t_gt_list=gt_t_list,
-            instance_id_list=matched_ids,
-            K=K
+            all_scene_feats,
+            all_cad_data,
+            all_candidate_poses,
+            all_R_gt,
+            all_t_gt,
+            all_instance_ids,
+            K=K_batch
         )
+
+    def freeze_candidates(self):
+        for param in self.feature_encoder.parameters():
+            param.requires_grad = False
+        for param in self.object_detector.parameters():
+            param.requires_grad = False
+        for param in self.pose_generator.parameters():
+            param.requires_grad = False
+
+    def freeze_refiner(self):
+        for param in self.refiner.parameters():
+            param.requires_grad = False
+
+
+        

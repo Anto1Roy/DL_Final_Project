@@ -1,23 +1,27 @@
 dataset:
   remote_base_url: ipd_data/ipd
   cam_ids: [cam2]
-  modality: [rgb, depth, aolp, dolp]
+  modality: [rgb, depth] #, aolp, dolp]
   train_split: train_pbr
   val_split: val
   model_split: models
 
 training:
-  batch_size: 1
+  batch_size: 4
   epochs: 1
   num_workers: 4
   device: cuda
   patience: 10
+  encoder: resnet
+  freeze_candidates: false
+  freeze_refiner: false
 
 optim:
   lr: 1e-4
   weight_decay: 0.0
 
 renderer:
-  image_size: 256
+  width: 640
+  height: 480
   device: cuda
   render_weight: 1.0

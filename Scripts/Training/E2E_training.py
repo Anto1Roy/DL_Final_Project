@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.cuda.amp import autocast, GradScaler
-from torch.autograd import Variable
 from tqdm import tqdm
 
 # Local
@@ -21,6 +20,12 @@ from Models.PoseEstimator import TwoStagePoseEstimator
 
 def save_checkpoint(state, filename):
     torch.save(state, filename)
+
+def custom_collate_fn(batch):
+    batch = [sample for sample in batch if sample is not None]
+    if len(batch) == 0:
+        return None
+    return batch
 
 def load_checkpoint(filepath, model, optimizer, scaler, scheduler):
     if os.path.exists(filepath):
@@ -50,9 +55,10 @@ def main():
     num_workers = int(config["training"]["num_workers"])
     device = torch.device(config["training"].get("device", "cuda") if torch.cuda.is_available() else "cpu")
     lr = float(config["optim"].get("lr", 1e-4))
+    encoder_type = config["training"].get("encoder", "fusenet")
 
     patience = config["training"].get("patience", 10)
-    renderer_config = config.get("renderer", {"image_size": 256, "device": device})
+    renderer_config = config.get("renderer", {"width": 640, "height": 480, "device": device})
 
     print("\n------Configurations------")
     print(f"Remote Base URL: {remote_base_url}")
@@ -66,12 +72,19 @@ def main():
     print(f"Num Workers: {num_workers}")
     print(f"Device: {device}")
     print(f"Learning Rate: {lr}")
+    print(f"Encoder Type: {encoder_type}")
     print(f"Patience: {patience}")
 
     torch.backends.cudnn.benchmark = True
 
-    # --- Dataset ---
-    dataset = IPDDatasetMounted(remote_base_url, cam_ids, modalities, split=train_split)
+    train_scene_ids = {f"{i:06d}" for i in range(0, 25)}
+    test_scene_ids = {f"{i:06d}" for i in range(25, 50)}
+
+    train_obj_ids = {0, 8, 18, 19, 20}
+    test_obj_ids = {1, 4, 10, 11, 14}
+
+    dataset = IPDDatasetMounted(remote_base_url, cam_ids, modalities, split=train_split,
+                                 allowed_obj_ids=train_obj_ids, allowed_scene_ids=train_scene_ids)
 
     valid_size = 0.2
     num_train = len(dataset)
@@ -83,12 +96,23 @@ def main():
     train_sampler = SubsetRandomSampler(train_idx)
     valid_sampler = SubsetRandomSampler(valid_idx)
 
-    train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler, num_workers=num_workers)
-    valid_loader = DataLoader(dataset, batch_size=batch_size, sampler=valid_sampler, num_workers=num_workers)
+    train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler,
+                              num_workers=num_workers, collate_fn=custom_collate_fn)
+    valid_loader = DataLoader(dataset, batch_size=batch_size, sampler=valid_sampler,
+                              num_workers=num_workers, collate_fn=custom_collate_fn)
 
-    # --- Model ---
     sensory_channels = {mod: 1 for mod in modalities}
-    model = TwoStagePoseEstimator(sensory_channels, renderer_config).to(device)
+    model = TwoStagePoseEstimator(
+        sensory_channels=sensory_channels,
+        renderer_config=renderer_config,
+        encoder_type=encoder_type
+    ).to(device)
+
+    if config["training"].get("freeze_candidates", False):
+        model.freeze_candidates()
+
+    if config["training"].get("freeze_refiner", False):
+        model.freeze_refiner()
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
@@ -97,83 +121,124 @@ def main():
 
     start_epoch, epoch_seed = load_checkpoint("checkpoint.pth", model, optimizer, scaler, scheduler)
 
-    rot_losses = []
-    trans_losses = []
-    render_losses = []
-    rot_losses_val = []
-    trans_losses_val = []
-    render_losses_val = []
-    avg_train_losses = []
-    avg_valid_losses = []
+    batch_train_losses = []
+    batch_valid_losses = []
 
     print("\n------Training------")
     for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
-        for batch in train_loader:
-            x_dict, R_gt_list, t_gt_list, K, cad_model_data_list, instance_ids = batch
-            x_dict = {k: v.to(device) for k, v in x_dict.items()}
-            R_gt_list = [R.to(device) for R in R_gt_list]
-            t_gt_list = [t.to(device) for t in t_gt_list]
-            K = K.to(device)
+        for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
 
-            cad_model_lookup = {obj_id: cad_data for obj_id, cad_data in zip(instance_ids[0], cad_model_data_list)}
+            if batch_idx > 40:
+                break
+            
+            x_dicts = [b[0] for b in batch]
+            Ks = [b[1] for b in batch]
+            R_gt_lists = [b[2] for b in batch]
+            t_gt_lists = [b[3] for b in batch]
+            instance_ids_lists = [b[4] for b in batch]
+            cad_model_data_lists = [b[5] for b in batch]
+
+            x_dict_batch = {
+                k: torch.stack([d[k] for d in x_dicts]).to(device).to(torch.float16)
+                for k in x_dicts[0].keys()
+            }
+            Ks = [k.to(device) for k in Ks]
+            R_gt = [[r.to(device) for r in Rs] for Rs in R_gt_lists]
+            t_gt = [[t.to(device) for t in Ts] for Ts in t_gt_lists]
 
             optimizer.zero_grad()
             with autocast():
-                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
-                    x_dict, K, cad_model_lookup, R_gt_list, t_gt_list, instance_ids[0]
+                outputs = model.compute_losses(
+                    x_dict_batch, Ks, cad_model_data_lists, R_gt_lists, t_gt_lists, instance_ids_lists
                 )
-            
-            rot_losses.append(rot_loss)
-            trans_losses.append(trans_loss)
-            render_losses.append(render_loss)
-            train_loss += loss.item()  
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # Check output validity
+            if outputs is None or outputs[0] is None:
+                print(f"[WARN] Skipping batch {batch_idx} due to None loss.")
+                continue
+
+            loss, rot_loss, trans_loss, render_loss = outputs
+
+            if torch.isfinite(loss):
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                print(f"[WARN] Skipping batch {batch_idx} due to non-finite loss: {loss}")
+                continue
 
             train_loss += loss.item()
+            batch_train_losses.append({
+                "epoch": epoch,
+                "batch": batch_idx,
+                "total_loss": loss.item(),
+                "rot_loss": rot_loss.item(),
+                "trans_loss": trans_loss.item(),
+                "render_loss": render_loss.item() if isinstance(render_loss, torch.Tensor) else float(render_loss)
+            })
 
         avg_train_loss = train_loss / len(train_loader)
-        avg_train_losses.append(avg_train_loss)
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f}")
 
         # --- Validation ---
         model.eval()
         valid_loss = 0.0
         with torch.no_grad():
-            for batch in valid_loader:
-                x_dict, R_gt_list, t_gt_list, K, _, _, instance_ids = batch
-                x_dict = {k: v.to(device) for k, v in x_dict.items()}
-                R_gt_list = [R.to(device) for R in R_gt_list]
-                t_gt_list = [t.to(device) for t in t_gt_list]
-                K = K.to(device).unsqueeze(0)
+            for batch_idx, batch in enumerate(valid_loader):
+                if batch is None:
+                    continue
 
-                cad_model_lookup = {obj_id: dataset.get_model_data(obj_id) for obj_id in set(sum(instance_ids, []))}
+                if batch_idx > 40:
+                    break
 
-                loss, _, _, _ = model.compute_losses(
-                    x_dict, K, cad_model_lookup, R_gt_list, t_gt_list, instance_ids[0]
+                x_dicts = [b[0] for b in batch]
+                Ks = [b[1] for b in batch]
+                R_gt_lists = [b[2] for b in batch]
+                t_gt_lists = [b[3] for b in batch]
+                instance_ids_lists = [b[4] for b in batch]
+                cad_model_data_lists = [b[5] for b in batch]
+
+                x_dict = {k: torch.stack([d[k] for d in x_dicts]).to(device) for k in x_dicts[0].keys()}
+                Ks = [k.to(device) for k in Ks]
+                R_gt = [[r.to(device) for r in Rs] for Rs in R_gt_lists]
+                t_gt = [[t.to(device) for t in Ts] for Ts in t_gt_lists]
+
+                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
+                    x_dict, Ks, cad_model_data_lists, R_gt, t_gt, instance_ids_lists
                 )
 
-                rot_losses_val.append(rot_loss.item())
-                trans_losses_val.append(trans_loss.item())
-                render_losses_val.append(render_loss.item())
                 valid_loss += loss.item()
+                batch_valid_losses.append({
+                    "epoch": epoch,
+                    "batch": batch_idx,
+                    "total_loss": loss.item(),
+                    "rot_loss": rot_loss.item(),
+                    "trans_loss": trans_loss.item(),
+                    "render_loss": render_loss.item() if isinstance(render_loss, torch.Tensor) else float(render_loss)
+                })
 
+        avg_valid_loss = valid_loss / len(valid_loader)
+        print(f"Validation Loss: {avg_valid_loss:.4f}")
+        scheduler.step(avg_valid_loss)
+        early_stopping(avg_valid_loss, model)
 
+        if early_stopping.early_stop:
+            print("Early stopping triggered.")
+            break
 
-            avg_valid_loss = valid_loss / len(valid_loader)
-            avg_valid_losses.append(avg_valid_loss)
-            print(f"Validation Loss: {avg_valid_loss:.4f}")
-            scheduler.step(avg_valid_loss)
-            early_stopping(avg_valid_loss, model)
+        # Save log
+        with open("loss_log.json", "w") as f:
+            json.dump({
+                "train": batch_train_losses,
+                "valid": batch_valid_losses
+            }, f, indent=2)
+        print("[INFO] Saved batch loss logs to loss_log.json.")
 
-            if early_stopping.early_stop:
-                print("Early stopping triggered.")
-                break
-
+        # Save checkpoint
         save_checkpoint({
             "epoch": epoch,
             "model_state": model.state_dict(),

@@ -3,22 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Models.helpers import *
-from Models.FuseEncoder import FuseEncoder
-from Models.FuseDecoder import FuseDecoder
 from Models.KaolinRenderer import KaolinRenderer
 
 class CosyPoseStyleRenderMatch(nn.Module):
-    def __init__(self, sensory_channels, renderer_config, num_candidates=32, use_learned_similarity=True, ngf=64):
+    def __init__(self, renderer_config, num_candidates=32, use_learned_similarity=True):
         super().__init__()
-        self.modalities = list(sensory_channels.keys())
         self.num_candidates = num_candidates
         self.use_learned_similarity = use_learned_similarity
         self.render_weight = renderer_config.get("render_weight", 1.0)
 
-        self.encoder = FuseEncoder(sensory_channels, ngf=ngf)
-        self.decoder = FuseDecoder(ngf=ngf)
         self.renderer = KaolinRenderer(
-            image_size=renderer_config["image_size"],
+            width=renderer_config["width"],
+            height=renderer_config["height"],
             fov=renderer_config.get("fov", 60.0),
             device=renderer_config["device"]
         )
@@ -35,44 +31,39 @@ class CosyPoseStyleRenderMatch(nn.Module):
             nn.Linear(32, 1)
         )
 
-    def extract_fused_features(self, x_dict):
-        x_filtered = {k: v for k, v in x_dict.items() if k in self.modalities}
-        x_latent, skip_feats = self.encoder(x_filtered)
-        fused = self.decoder(x_latent, skip_feats)
-        return F.adaptive_avg_pool2d(fused, (1, 1)).view(fused.size(0), -1)
-
-    def forward(self, x_dict, cad_model_data_list, candidate_pose_list, instance_id_list):
+    def forward(self, feat_map, cad_model_data_list, candidate_pose_list, instance_id_list, K=None):
         results = []
         all_best_R = []
         all_best_t = []
-        scene_feat = self.extract_fused_features(x_dict)  # (B, F)
 
-        for i, (cad_data, candidate_poses, inst_ids) in enumerate(zip(cad_model_data_list, candidate_pose_list, instance_id_list)):
-            candidate_poses = candidate_poses.unsqueeze(0)  # Make it (B=1, N, 4, 4)
+        scene_feat = F.adaptive_avg_pool2d(feat_map, (1, 1)).view(feat_map.size(0), -1)  # (B, F)
+
+        for i in range(len(candidate_pose_list)):
+            verts, faces = cad_model_data_list[i]
+            candidate_poses = candidate_pose_list[i]
+            inst_ids = instance_id_list[i]
+
             B, N = candidate_poses.shape[:2]
-            verts, faces = cad_data
             device = candidate_poses.device
 
             if verts.dim() == 2:
-                print("Warning b: verts dim is 2, adding batch dimension")
                 verts = verts.unsqueeze(0).repeat(B, 1, 1)
             if faces.dim() == 2:
-                print("Warning b: faces dim is 2, adding batch dimension")
                 faces = faces.unsqueeze(0).repeat(B, 1, 1)
 
             cad_feats = []
             for n in range(N):
-                pose = candidate_poses[:, n]  # (B, 4, 4)
+                pose = candidate_poses[:, n]
                 R = pose[:, :3, :3]
                 T = pose[:, :3, 3]
 
-                rendered = self.renderer(verts, faces, R, T)  # (B, H, W, 3)
+                rendered = self.renderer(verts, faces, R, T, K=K[i])  # (B, H, W, 3)
                 gray = rendered.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)  # (B, 1, H, W)
-                cad_feat = self.render_encoder(gray)  # (B, F)
+                cad_feat = self.render_encoder(gray)
                 cad_feats.append(cad_feat)
 
             cad_feats = torch.stack(cad_feats, dim=1)  # (B, N, F)
-            scene_exp = scene_feat.unsqueeze(1).expand_as(cad_feats)
+            scene_exp = scene_feat[i].unsqueeze(0).expand_as(cad_feats)
 
             if self.use_learned_similarity:
                 sim_input = torch.cat([scene_exp, cad_feats], dim=-1)  # (B, N, 128)
@@ -98,29 +89,36 @@ class CosyPoseStyleRenderMatch(nn.Module):
 
         return results, R_tensor, t_tensor
 
-    def compute_losses(self, x_dict, cad_model_data_list, candidate_pose_list,
+    def compute_losses(self, feat_maps, cad_model_data_list, candidate_pose_list,
                        R_gt_list, t_gt_list, instance_id_list, K=None):
         all_rot_loss, all_trans_loss, all_render_loss = 0.0, 0.0, 0.0
         B_total = 0
 
-        for cad_model_data, candidate_poses, R_gt, t_gt, instance_ids in zip(
-                cad_model_data_list, candidate_pose_list, R_gt_list, t_gt_list, instance_id_list):
+        for i in range(len(feat_maps)):
+            feat_map = feat_maps[i]
+            R_gt = torch.stack(R_gt_list[i], dim=0)
+            t_gt = torch.stack(t_gt_list[i], dim=0)
+            K_i = K[i] if K is not None else None
 
-            _, R_pred, t_pred = self.forward(x_dict, [cad_model_data], [candidate_poses], [instance_ids])
+            _, R_pred, t_pred = self.forward(
+                feat_map.unsqueeze(0),
+                [cad_model_data_list[i]],
+                [candidate_pose_list[i]],
+                [instance_id_list[i]],
+                K=[K_i] if K_i is not None else None
+            )
 
             rot_loss = F.mse_loss(R_pred, R_gt)
             trans_loss = F.mse_loss(t_pred, t_gt)
 
-            verts, faces = cad_model_data
+            verts, faces = cad_model_data_list[i]
             if verts.dim() == 2:
-                print("Warning a: verts dim is 2, adding batch dimension")
                 verts = verts.unsqueeze(0).repeat(R_gt.size(0), 1, 1)
             if faces.dim() == 2:
-                print("Warning a: faces dim is 2, adding batch dimension")
                 faces = faces.unsqueeze(0).repeat(R_gt.size(0), 1, 1)
 
-            mask_pred = self.renderer(verts, faces, R_pred, t_pred, K=K)
-            mask_gt = self.renderer(verts, faces, R_gt, t_gt, K=K)
+            mask_pred = self.renderer(verts, faces, R_pred, t_pred, K=K_i)
+            mask_gt = self.renderer(verts, faces, R_gt, t_gt, K=K_i)
             render_loss = F.binary_cross_entropy_with_logits(mask_pred, mask_gt)
 
             all_rot_loss += rot_loss * R_gt.size(0)
