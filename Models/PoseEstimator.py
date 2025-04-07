@@ -9,6 +9,12 @@ from Models.CandidatePose import CandidatePoseModel
 from Models.CozyPose import CosyPoseStyleRenderMatch
 from Models.helpers import quaternion_to_matrix
 
+def pose_distance(R1, t1, R2, t2):
+    """Compute a simple pose distance: rotation + translation norm"""
+    rot_diff = torch.norm(R1 - R2)
+    trans_diff = torch.norm(t1 - t2)
+    return rot_diff + trans_diff
+
 class TwoStagePoseEstimator(nn.Module):
     def __init__(self, sensory_channels, renderer_config, encoder_type="resnet", num_candidates=32, noise_level=0.05, conf_thresh=0.5):
         super().__init__()
@@ -34,22 +40,32 @@ class TwoStagePoseEstimator(nn.Module):
         outputs = self.det_head.forward(feat_map)
         detections = self.det_head.decode_poses(outputs, top_k=top_k)
         return [d for d in detections if d["score"] >= self.conf_thresh], outputs
-
+    
     def sample_candidates(self, detections):
         candidates_all = []
         for det in detections:
-            quat = det["quat"].unsqueeze(0).expand(self.num_candidates, -1)
-            trans = det["trans"].unsqueeze(0).expand(self.num_candidates, -1)
-            noise_q = torch.randn_like(quat) * self.noise_level
-            noise_t = torch.randn_like(trans) * self.noise_level
-            noisy_q = F.normalize(quat + noise_q, dim=-1)
-            noisy_t = trans + noise_t
-            R = quaternion_to_matrix(noisy_q)
-            poses = torch.eye(4, device=quat.device).repeat(self.num_candidates, 1, 1)
+            # Base pose (no noise)
+            base_q = det["quat"].unsqueeze(0)
+            base_t = det["trans"].unsqueeze(0)
+
+            # Generate noisy versions
+            noisy_q = F.normalize(
+                base_q + torch.randn((self.num_candidates - 1, 4), device=base_q.device) * self.noise_level,
+                dim=-1
+            )
+            noisy_t = base_t + torch.randn((self.num_candidates - 1, 3), device=base_t.device) * self.noise_level
+
+            all_q = torch.cat([base_q, noisy_q], dim=0)  # (N, 4)
+            all_t = torch.cat([base_t, noisy_t], dim=0)  # (N, 3)
+
+            R = quaternion_to_matrix(all_q)
+            poses = torch.eye(4, device=base_q.device).repeat(self.num_candidates, 1, 1)
             poses[:, :3, :3] = R
-            poses[:, :3, 3] = noisy_t
+            poses[:, :3, 3] = all_t
+
             candidates_all.append(poses)
         return candidates_all
+
 
     def score_candidates(self, feat_map, K, candidates_all, cad_model_lookup):
         all_results = []
@@ -64,83 +80,92 @@ class TwoStagePoseEstimator(nn.Module):
             all_results.extend(scores)
         return all_results
 
-    def forward(self, x):
-        features = self.feature_encoder(x)
-        detections = self.object_detector(features)
-        return detections
+    def forward(self, x_dict, K, cad_model_lookup, top_k=20):
+        feat_map = self.extract_features(x_dict)
+        detections, _ = self.detect(feat_map, top_k=top_k)
+        candidates_per_det = self.sample_candidates(detections)
 
-    def compute_losses(self, x_dict_batch, K_batch, cad_model_lookup, R_gt_batch, t_gt_batch, instance_ids_batch):
-        feat_maps = self.encoder(x_dict_batch)
+        return self.score_candidates(
+            feat_map=feat_map,
+            K=K,
+            candidates_all=candidates_per_det,
+            cad_model_lookup={d["obj_id"]: cad_model_lookup[d["obj_id"]] for d in detections}
+        )
 
-        all_scene_feats = []
-        all_cad_data = []
-        all_candidate_poses = []
-        all_instance_ids = []
-        all_R_gt = []
-        all_t_gt = []
+    def compute_losses(self, x_dict, K, cad_model_lookup, R_gt_list, t_gt_list, instance_id_list):
+        """
+        Args:
+            x_dict: Dictionary with stacked input for the batch.
+            K: List of camera intrinsic matrices for each sample in the batch.
+            cad_model_lookup: Lookup table for CAD models.
+            R_gt_list: Batch of lists, each containing ground truth rotation matrices for each sample.
+            t_gt_list: Batch of lists, each containing ground truth translation vectors for each sample.
+            instance_id_list: Batch of lists, each containing instance IDs for each sample.
+        """
+        
+        # Step 1: Feature extraction
+        feat_map = self.extract_features(x_dict)
+        
+        # Step 2: Detection and candidate generation
+        detections, _ = self.detect(feat_map, top_k=20)
+        detections = [d for d in detections if d["score"] >= self.conf_thresh]
+        
+        # Step 3: Match predictions to GT for each sample in the batch
+        matched_detections, matched_gt_R, matched_gt_t, matched_ids = [], [], [], []
+        used_indices = set()
 
-        for i in range(len(feat_maps)):
-            feat_map = feat_maps[i]
-            K = K_batch[i]
-            R_gt_list = R_gt_batch[i]
-            t_gt_list = t_gt_batch[i]
-            inst_ids = instance_ids_batch[i]
-            cad_models = []
-            poses = []
-            R_gt = []
-            t_gt = []
-            instance_ids = []
+        # Iterate over each sample in the batch
+        for R_gt_batch, t_gt_batch, instance_id_batch in zip(R_gt_list, t_gt_list, instance_id_list):
+            # Ensure that each sample can handle multiple detections
+            for R_gt, t_gt, instance_id in zip(R_gt_batch, t_gt_batch, instance_id_batch):
+                best_match, best_dist = None, float("inf")
+                for j, det in enumerate(detections):
+                    if j in used_indices:
+                        continue
+                    # Compute the distance between the detection and the ground truth
+                    dist = pose_distance(
+                        quaternion_to_matrix(det["quat"].unsqueeze(0))[0], det["trans"], R_gt, t_gt
+                    )
+                    if dist < best_dist:
+                        best_match = (j, det)
+                        best_dist = dist
+                if best_match:
+                    j, matched = best_match
+                    used_indices.add(j)
+                    matched_detections.append(matched)
+                    matched_gt_R.append(R_gt)
+                    matched_gt_t.append(t_gt)
+                    matched_ids.append(instance_id)
 
-            for j, obj_id in enumerate(inst_ids):
-                if obj_id not in cad_model_lookup:
-                    continue
-                verts, faces = cad_model_lookup[obj_id]
-                quat = torch.randn(self.num_candidates, 4, device=feat_map.device)
-                quat = F.normalize(quat, dim=-1)
-                trans = torch.randn(self.num_candidates, 3, device=feat_map.device) * 0.05
-                R = quaternion_to_matrix(quat)
-                pose = torch.eye(4, device=feat_map.device).repeat(self.num_candidates, 1, 1)
-                pose[:, :3, :3] = R
-                pose[:, :3, 3] = trans
-                cad_models.append((verts, faces))
-                poses.append(pose)
-                R_gt.append(R_gt_list[j])
-                t_gt.append(t_gt_list[j])
-                instance_ids.append(obj_id)
-
-            if poses:
-                all_scene_feats.append(feat_map)
-                all_cad_data.append(cad_models)
-                all_candidate_poses.append(poses)
-                all_instance_ids.append(instance_ids)
-                all_R_gt.append(R_gt)
-                all_t_gt.append(t_gt)
-
-        if len(all_scene_feats) == 0:
-            zero = torch.tensor(0.0, requires_grad=True, device=feat_maps[0].device)
+        if not matched_detections:
+            print("[WARN] No valid matches between detections and GT.")
+            device = x_dict[next(iter(x_dict))].device
+            zero = torch.tensor(0.0, device=device)
             return zero, zero, zero, zero
 
+        # Step 4: Sample candidates for matching detections
+        candidates_all = self.sample_candidates(matched_detections)
+        cad_model_data_list = [cad_model_lookup[0] for _ in matched_detections] 
+        K_list = [K for _ in matched_detections]  
+        feat_maps = [feat_map for _ in matched_detections]  
+
+        # Step 5: Compute loss using refiner
         return self.refiner.compute_losses(
-            all_scene_feats,
-            all_cad_data,
-            all_candidate_poses,
-            all_R_gt,
-            all_t_gt,
-            all_instance_ids,
-            K=K_batch
+            feat_maps=feat_maps,
+            cad_model_data_list=cad_model_data_list,
+            candidate_pose_list=candidates_all,
+            R_gt_list=matched_gt_R,
+            t_gt_list=matched_gt_t,
+            instance_id_list=matched_ids,
+            K_list=K_list
         )
 
     def freeze_candidates(self):
-        for param in self.feature_encoder.parameters():
+        for param in self.encoder.parameters():
             param.requires_grad = False
-        for param in self.object_detector.parameters():
-            param.requires_grad = False
-        for param in self.pose_generator.parameters():
+        for param in self.det_head.parameters():
             param.requires_grad = False
 
     def freeze_refiner(self):
         for param in self.refiner.parameters():
             param.requires_grad = False
-
-
-        

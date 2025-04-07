@@ -31,58 +31,53 @@ class CosyPoseStyleRenderMatch(nn.Module):
             nn.Linear(32, 1)
         )
 
-    def forward(self, feat_map, cad_model_data_list, candidate_pose_list, instance_id_list, K=None):
+    def forward(self, feat_maps, cad_models, candidate_poses_list, instance_ids, K_list=None):
         results = []
         all_best_R = []
         all_best_t = []
 
-        scene_feat = F.adaptive_avg_pool2d(feat_map, (1, 1)).view(feat_map.size(0), -1)  # (B, F)
+        for i in range(len(candidate_poses_list)):
+            feat_map = F.adaptive_avg_pool2d(feat_maps[i], (1, 1)).view(1, -1)  # (1, F)
+            verts, faces = cad_models[i]
+            candidate_poses = candidate_poses_list[i]  # (N, 4, 4)
+            obj_id = instance_ids[i]
+            K = K_list[i] if K_list is not None else None
 
-        for i in range(len(candidate_pose_list)):
-            verts, faces = cad_model_data_list[i]
-            candidate_poses = candidate_pose_list[i]
-            inst_ids = instance_id_list[i]
-
-            B, N = candidate_poses.shape[:2]
-            device = candidate_poses.device
-
-            if verts.dim() == 2:
-                verts = verts.unsqueeze(0).repeat(B, 1, 1)
-            if faces.dim() == 2:
-                faces = faces.unsqueeze(0).repeat(B, 1, 1)
+            verts = verts.unsqueeze(0) if verts.dim() == 2 else verts
+            faces = faces.unsqueeze(0) if faces.dim() == 2 else faces
 
             cad_feats = []
-            for n in range(N):
-                pose = candidate_poses[:, n]
+            for n in range(candidate_poses.shape[0]):
+                pose = candidate_poses[n].unsqueeze(0)  # (1, 4, 4)
                 R = pose[:, :3, :3]
                 T = pose[:, :3, 3]
 
-                rendered = self.renderer(verts, faces, R, T, K=K[i])  # (B, H, W, 3)
-                gray = rendered.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)  # (B, 1, H, W)
-                cad_feat = self.render_encoder(gray)
+                rendered = self.renderer(verts, faces, R, T, K=K)  # (1, H, W, 3)
+                gray = rendered.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)  # (1, 1, H, W)
+                cad_feat = self.render_encoder(gray)  # (1, F)
                 cad_feats.append(cad_feat)
 
-            cad_feats = torch.stack(cad_feats, dim=1)  # (B, N, F)
-            scene_exp = scene_feat[i].unsqueeze(0).expand_as(cad_feats)
+            cad_feats = torch.cat(cad_feats, dim=0).unsqueeze(0)  # (1, N, F)
+            scene_exp = feat_map.unsqueeze(1).expand_as(cad_feats)  # (1, N, F)
 
             if self.use_learned_similarity:
-                sim_input = torch.cat([scene_exp, cad_feats], dim=-1)  # (B, N, 128)
-                sim_scores = self.sim_head(sim_input).squeeze(-1)  # (B, N)
+                sim_input = torch.cat([scene_exp, cad_feats], dim=-1)  # (1, N, 128)
+                sim_scores = self.sim_head(sim_input).squeeze(0).squeeze(-1)  # (N,)
             else:
-                sim_scores = F.cosine_similarity(scene_exp, cad_feats, dim=-1)
+                sim_scores = F.cosine_similarity(scene_exp.squeeze(0), cad_feats.squeeze(0), dim=-1)  # (N,)
 
-            best_idx = torch.argmax(sim_scores, dim=-1)  # (B,)
-            best_pose = torch.stack([candidate_poses[b, idx] for b, idx in enumerate(best_idx)], dim=0)
-            all_best_R.append(best_pose[:, :3, :3])
-            all_best_t.append(best_pose[:, :3, 3])
+            best_idx = torch.argmax(sim_scores, dim=0)  # ()
+            best_pose = candidate_poses[best_idx]  # (4, 4)
 
-            for b in range(B):
-                results.append({
-                    "obj_id": int(inst_ids[b]),
-                    "score": float(sim_scores[b, best_idx[b]].item()),
-                    "cam_R_m2c": best_pose[b, :3, :3].detach().cpu().numpy().tolist(),
-                    "cam_t_m2c": (best_pose[b, :3, 3] * 1000.0).detach().cpu().numpy().tolist()
-                })
+            all_best_R.append(best_pose[:3, :3].unsqueeze(0))
+            all_best_t.append(best_pose[:3, 3].unsqueeze(0))
+
+            results.append({
+                "obj_id": int(obj_id),
+                "score": float(sim_scores[best_idx].item()),
+                "cam_R_m2c": best_pose[:3, :3].detach().cpu().numpy().tolist(),
+                "cam_t_m2c": (best_pose[:3, 3] * 1000.0).detach().cpu().numpy().tolist()
+            })
 
         R_tensor = torch.cat(all_best_R, dim=0)
         t_tensor = torch.cat(all_best_t, dim=0)
@@ -90,45 +85,44 @@ class CosyPoseStyleRenderMatch(nn.Module):
         return results, R_tensor, t_tensor
 
     def compute_losses(self, feat_maps, cad_model_data_list, candidate_pose_list,
-                       R_gt_list, t_gt_list, instance_id_list, K=None):
-        all_rot_loss, all_trans_loss, all_render_loss = 0.0, 0.0, 0.0
-        B_total = 0
+                       R_gt_list, t_gt_list, instance_id_list, K_list=None):
+        device = feat_maps[0].device
+        R_gt_tensor = torch.stack(R_gt_list).to(device)
+        t_gt_tensor = torch.stack(t_gt_list).to(device)
 
-        for i in range(len(feat_maps)):
-            feat_map = feat_maps[i]
-            R_gt = torch.stack(R_gt_list[i], dim=0)
-            t_gt = torch.stack(t_gt_list[i], dim=0)
-            K_i = K[i] if K is not None else None
+        _, R_pred, t_pred = self.forward(
+            feat_maps,
+            cad_model_data_list,
+            candidate_pose_list,
+            instance_id_list,
+            K_list=K_list
+        )
 
-            _, R_pred, t_pred = self.forward(
-                feat_map.unsqueeze(0),
-                [cad_model_data_list[i]],
-                [candidate_pose_list[i]],
-                [instance_id_list[i]],
-                K=[K_i] if K_i is not None else None
-            )
+        rot_loss = F.mse_loss(R_pred, R_gt_tensor)
+        trans_loss = F.mse_loss(t_pred, t_gt_tensor)
 
-            rot_loss = F.mse_loss(R_pred, R_gt)
-            trans_loss = F.mse_loss(t_pred, t_gt)
-
+        render_losses = []
+        for i in range(len(R_gt_list)):
             verts, faces = cad_model_data_list[i]
-            if verts.dim() == 2:
-                verts = verts.unsqueeze(0).repeat(R_gt.size(0), 1, 1)
-            if faces.dim() == 2:
-                faces = faces.unsqueeze(0).repeat(R_gt.size(0), 1, 1)
 
-            mask_pred = self.renderer(verts, faces, R_pred, t_pred, K=K_i)
-            mask_gt = self.renderer(verts, faces, R_gt, t_gt, K=K_i)
+            verts = verts.unsqueeze(0) # (1, V, 3)
+            faces = faces.unsqueeze(0) # (1, F, 3)
+
+            R_pred_i = R_pred[i].unsqueeze(0)
+            t_pred_i = t_pred[i].unsqueeze(0)
+            R_gt_i = R_gt_tensor[i].unsqueeze(0)
+            t_gt_i = t_gt_tensor[i].unsqueeze(0)
+            K_i = K_list[i].unsqueeze(0)
+
+            mask_pred = self.renderer(verts, faces, R_pred_i, t_pred_i, K=K_i)
+            mask_gt = self.renderer(verts, faces, R_gt_i, t_gt_i, K=K_i)
             render_loss = F.binary_cross_entropy_with_logits(mask_pred, mask_gt)
+            render_losses.append(render_loss)
 
-            all_rot_loss += rot_loss * R_gt.size(0)
-            all_trans_loss += trans_loss * t_gt.size(0)
-            all_render_loss += render_loss * t_gt.size(0)
-            B_total += R_gt.size(0)
+        avg_render_loss = torch.stack(render_losses).mean()
 
-        avg_rot_loss = all_rot_loss / B_total
-        avg_trans_loss = all_trans_loss / B_total
-        avg_render_loss = all_render_loss / B_total
-
-        total_loss = avg_rot_loss + avg_trans_loss + self.render_weight * avg_render_loss
-        return total_loss, avg_rot_loss, avg_trans_loss, avg_render_loss
+        if torch.isnan(avg_render_loss) or torch.isinf(avg_render_loss):
+            total_loss = rot_loss + trans_loss
+        else:
+            total_loss = rot_loss + trans_loss + self.render_weight * avg_render_loss
+        return total_loss, rot_loss, trans_loss, avg_render_loss

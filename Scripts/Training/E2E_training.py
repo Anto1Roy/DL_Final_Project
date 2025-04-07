@@ -17,7 +17,6 @@ from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Classes.EarlyStopping import EarlyStopping
 from Models.PoseEstimator import TwoStagePoseEstimator
 
-
 def save_checkpoint(state, filename):
     torch.save(state, filename)
 
@@ -26,6 +25,26 @@ def custom_collate_fn(batch):
     if len(batch) == 0:
         return None
     return batch
+
+def vectorize_training_batch(batch, device):
+    x_dicts = [b[0] for b in batch]
+    Ks = [b[1].to(device) for b in batch]
+    R_gt_lists = [b[2] for b in batch]
+    t_gt_lists = [b[3] for b in batch]
+    instance_ids_lists = [b[4] for b in batch]
+    cad_model_data_lists = [b[5] for b in batch]
+
+    x_dict_batch = {
+        k: torch.stack([d[k] for d in x_dicts]).to(device).to(torch.float16)
+        for k in x_dicts[0].keys()
+    }
+    for i in range(len(batch)):
+        R_gt_lists[i] = [r.to(device) for r in R_gt_lists[i]]
+        t_gt_lists[i] = [t.to(device) for t in t_gt_lists[i]]
+        instance_ids_lists[i] = [int(id) for id in instance_ids_lists[i]]
+        cad_model_data_lists[i] = [(verts.to(device), faces.to(device)) for verts, faces in cad_model_data_lists[i]]
+
+    return x_dict_batch, Ks, R_gt_lists, t_gt_lists, instance_ids_lists, cad_model_data_lists
 
 def load_checkpoint(filepath, model, optimizer, scaler, scheduler):
     if os.path.exists(filepath):
@@ -59,21 +78,6 @@ def main():
 
     patience = config["training"].get("patience", 10)
     renderer_config = config.get("renderer", {"width": 640, "height": 480, "device": device})
-
-    print("\n------Configurations------")
-    print(f"Remote Base URL: {remote_base_url}")
-    print(f"Cam IDs: {cam_ids}")
-    print(f"Modalities: {modalities}")
-    print(f"Train Split: {train_split}")
-    print(f"Validation Split: {val_split}")
-    print(f"Renderer Config: {renderer_config}")
-    print(f"Batch Size: {batch_size}")
-    print(f"Epochs: {epochs}")
-    print(f"Num Workers: {num_workers}")
-    print(f"Device: {device}")
-    print(f"Learning Rate: {lr}")
-    print(f"Encoder Type: {encoder_type}")
-    print(f"Patience: {patience}")
 
     torch.backends.cudnn.benchmark = True
 
@@ -132,44 +136,17 @@ def main():
             if batch is None:
                 continue
 
-            if batch_idx > 40:
-                break
-            
-            x_dicts = [b[0] for b in batch]
-            Ks = [b[1] for b in batch]
-            R_gt_lists = [b[2] for b in batch]
-            t_gt_lists = [b[3] for b in batch]
-            instance_ids_lists = [b[4] for b in batch]
-            cad_model_data_lists = [b[5] for b in batch]
-
-            x_dict_batch = {
-                k: torch.stack([d[k] for d in x_dicts]).to(device).to(torch.float16)
-                for k in x_dicts[0].keys()
-            }
-            Ks = [k.to(device) for k in Ks]
-            R_gt = [[r.to(device) for r in Rs] for Rs in R_gt_lists]
-            t_gt = [[t.to(device) for t in Ts] for Ts in t_gt_lists]
+            x_dict_batch, Ks_flat, R_gt_flat, t_gt_flat, instance_ids_flat, cad_models_flat = vectorize_training_batch(batch, device)
 
             optimizer.zero_grad()
             with autocast():
-                outputs = model.compute_losses(
-                    x_dict_batch, Ks, cad_model_data_lists, R_gt_lists, t_gt_lists, instance_ids_lists
+                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
+                    x_dict_batch, Ks_flat, cad_models_flat, R_gt_flat, t_gt_flat, instance_ids_flat
                 )
 
-            # Check output validity
-            if outputs is None or outputs[0] is None:
-                print(f"[WARN] Skipping batch {batch_idx} due to None loss.")
-                continue
-
-            loss, rot_loss, trans_loss, render_loss = outputs
-
-            if torch.isfinite(loss):
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                print(f"[WARN] Skipping batch {batch_idx} due to non-finite loss: {loss}")
-                continue
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
             batch_train_losses.append({
@@ -178,13 +155,14 @@ def main():
                 "total_loss": loss.item(),
                 "rot_loss": rot_loss.item(),
                 "trans_loss": trans_loss.item(),
-                "render_loss": render_loss.item() if isinstance(render_loss, torch.Tensor) else float(render_loss)
+                "render_loss": render_loss.item() if render_loss is not None else 0
             })
+
+            print(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} | Rot Loss: {rot_loss.item():.4f}")
 
         avg_train_loss = train_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f}")
 
-        # --- Validation ---
         model.eval()
         valid_loss = 0.0
         with torch.no_grad():
@@ -192,23 +170,10 @@ def main():
                 if batch is None:
                     continue
 
-                if batch_idx > 40:
-                    break
-
-                x_dicts = [b[0] for b in batch]
-                Ks = [b[1] for b in batch]
-                R_gt_lists = [b[2] for b in batch]
-                t_gt_lists = [b[3] for b in batch]
-                instance_ids_lists = [b[4] for b in batch]
-                cad_model_data_lists = [b[5] for b in batch]
-
-                x_dict = {k: torch.stack([d[k] for d in x_dicts]).to(device) for k in x_dicts[0].keys()}
-                Ks = [k.to(device) for k in Ks]
-                R_gt = [[r.to(device) for r in Rs] for Rs in R_gt_lists]
-                t_gt = [[t.to(device) for t in Ts] for Ts in t_gt_lists]
+                x_dict_batch, Ks_flat, R_gt_flat, t_gt_flat, instance_ids_flat, cad_models_flat = vectorize_training_batch(batch, device)
 
                 loss, rot_loss, trans_loss, render_loss = model.compute_losses(
-                    x_dict, Ks, cad_model_data_lists, R_gt, t_gt, instance_ids_lists
+                    x_dict_batch, Ks_flat, cad_models_flat, R_gt_flat, t_gt_flat, instance_ids_flat
                 )
 
                 valid_loss += loss.item()
@@ -218,8 +183,10 @@ def main():
                     "total_loss": loss.item(),
                     "rot_loss": rot_loss.item(),
                     "trans_loss": trans_loss.item(),
-                    "render_loss": render_loss.item() if isinstance(render_loss, torch.Tensor) else float(render_loss)
+                    "render_loss": render_loss.item() if render_loss is not None else 0
                 })
+
+                print(f"[VAL] Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} | Rot Loss: {rot_loss.item():.4f}")
 
         avg_valid_loss = valid_loss / len(valid_loader)
         print(f"Validation Loss: {avg_valid_loss:.4f}")
@@ -230,7 +197,6 @@ def main():
             print("Early stopping triggered.")
             break
 
-        # Save log
         with open("loss_log.json", "w") as f:
             json.dump({
                 "train": batch_train_losses,
@@ -238,7 +204,6 @@ def main():
             }, f, indent=2)
         print("[INFO] Saved batch loss logs to loss_log.json.")
 
-        # Save checkpoint
         save_checkpoint({
             "epoch": epoch,
             "model_state": model.state_dict(),

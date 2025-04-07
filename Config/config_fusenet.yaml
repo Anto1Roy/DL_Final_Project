@@ -7,9 +7,9 @@ dataset:
   model_split: models
 
 training:
-  batch_size: 4
+  batch_size: 2
   epochs: 1
-  num_workers: 4
+  num_workers: 2
   device: cuda
   patience: 10
   encoder: resnet
