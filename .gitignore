@@ -3,3 +3,5 @@
 *.pyc
 *.pkl
 *.pth
+*.pt
+*.json
