@@ -26,62 +26,6 @@ def custom_collate_fn(batch):
         return None
     return batch
 
-def vectorize_training_batch(batch, device):
-    """
-    Handles multi-view + multi-modality batches.
-    Each sample in the batch contains:
-        - x_dict: modality -> List[Tensor] (one per view)
-        - Ks: (V, 3, 3) tensor
-        - R_gt: List[Tensor]
-        - t_gt: List[Tensor]
-        - instance_ids: List[int]
-        - cad_models: List[(verts, faces)]
-    
-    Returns:
-        x_dict_views: modality -> Tensor of shape (B, V, C, H, W)
-        Ks_views: (B, V, 3, 3)
-        R_gt_all: (M, 3, 3)
-        t_gt_all: (M, 3)
-        instance_ids_all: List[int]
-        cad_models_all: List[(verts, faces)]
-        sample_indices_all: (M,) tensor mapping objects to their sample
-    """
-    B = len(batch)
-    modalities = batch[0][0].keys()
-    V = len(batch[0][0][next(iter(modalities))])  # number of views
-
-    # Init modality-wise storage
-    x_dict_views = {mod: [] for mod in modalities}
-    Ks_views = []
-
-    R_gt_all, t_gt_all = [], []
-    instance_ids_all, cad_models_all, sample_indices_all = [], [], []
-
-    for sample_idx, (x_dict, Ks, R_list, t_list, id_list, cad_list) in enumerate(batch):
-        # Append per-view modalities
-        for mod in modalities:
-            # List[Tensor(V, C, H, W)] → append one sample of V tensors
-            x_dict_views[mod].append(torch.stack(x_dict[mod]).to(device).to(torch.float16))  # (V, C, H, W)
-
-        Ks_views.append(Ks.to(device))  # (V, 3, 3)
-
-        for i in range(len(id_list)):
-            R_gt_all.append(R_list[i].to(device))
-            t_gt_all.append(t_list[i].to(device))
-            instance_ids_all.append(int(id_list[i]))
-            cad_models_all.append((cad_list[i][0].to(device), cad_list[i][1].to(device)))
-            sample_indices_all.append(sample_idx)
-
-    # Stack per modality to shape (B, V, C, H, W)
-    x_dict_views = {mod: torch.stack(x_dict_views[mod]) for mod in modalities}
-    Ks_views = torch.stack(Ks_views)  # (B, V, 3, 3)
-
-    R_gt_all = torch.stack(R_gt_all)
-    t_gt_all = torch.stack(t_gt_all)
-    sample_indices_all = torch.tensor(sample_indices_all, device=device)
-
-    return x_dict_views, Ks_views, R_gt_all, t_gt_all, instance_ids_all, cad_models_all, sample_indices_all
-
 def load_checkpoint(filepath, model, optimizer, scaler, scheduler):
     if os.path.exists(filepath):
         print(f"\nLoading checkpoint from {filepath}\n")
@@ -159,7 +103,7 @@ def main():
     scaler = GradScaler()
     early_stopping = EarlyStopping(patience=patience, verbose=True, path="checkpoint.pt")
 
-    start_epoch, epoch_seed = load_checkpoint("checkpoint.pth", model, optimizer, scaler, scheduler)
+    start_epoch, epoch_seed = 0, 0 #load_checkpoint("checkpoint.pth", model, optimizer, scaler, scheduler)
 
     batch_train_losses = []
     batch_valid_losses = []
@@ -168,6 +112,7 @@ def main():
     for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
+        train_sample = 0
         for batch_idx, batch in enumerate(train_loader):
             if batch is None:
                 continue
@@ -175,35 +120,67 @@ def main():
             if batch_idx > 20:
                 break
 
-            x_dict_batch, Ks, R_gt, t_gt, instance_ids, cad_models, sample_indices = vectorize_training_batch(batch, device)
+            batch_avg_loss = []
+            batch_avg_render_loss = []
+            batch_avg_add_s_loss = []
 
-            optimizer.zero_grad()
-            with autocast():
-                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
-                    x_dict_batch, Ks, cad_models, R_gt, t_gt, instance_ids, sample_indices
-                )
+            for sample in batch:
+                if sample is None:
+                    continue
 
-            scaler.scale(loss).backward()
+                x_dict_views = sample["views"]
+                Ks = sample["K"].to(device)
+                R_gt = [R.to(device) for R in sample["R_gt"]]
+                t_gt = [t.to(device) for t in sample["t_gt"]]
+                instance_ids = [int(i) for i in sample["instance_ids"]]
+                cad_models = [(v.to(device), f.to(device)) for v, f in sample["cad_models"]]
+
+                x_dict_views = [
+                    {mod: tensor.to(device) for mod, tensor in views.items()}
+                    for views in x_dict_views
+                ]
+
+                with autocast():
+                    loss, render_loss, add_s_loss = model.compute_loss(
+                        x_dict_views=x_dict_views,
+                        K_list=Ks,
+                        cad_model_data=cad_models,
+                        R_gt_list=R_gt,
+                        t_gt_list=t_gt,
+                        instance_id_list=instance_ids
+                    )
+
+                batch_avg_loss.append(loss)
+                batch_avg_render_loss.append(render_loss.item())
+                batch_avg_add_s_loss.append(add_s_loss.item())
+
+            # Average the batch loss
+            avg_loss = torch.stack(batch_avg_loss).mean()  # keeps gradient + stays on GPU
+            batch_avg_render_loss = np.mean(batch_avg_render_loss)
+            batch_avg_add_s_loss = np.mean(batch_avg_add_s_loss)
+
+            print(f"Batch {batch_idx} | Loss: {avg_loss.item():.4f} | ADD Loss: {batch_avg_add_s_loss:.4f} | Render Loss: {batch_avg_render_loss:.4f}")
+            
+            scaler.scale(avg_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += loss.item()
+            train_sample += 1
             batch_train_losses.append({
                 "epoch": epoch,
                 "batch": batch_idx,
                 "total_loss": loss.item(),
-                "rot_loss": rot_loss.item(),
-                "trans_loss": trans_loss.item(),
+                "trans_loss": add_s_loss.item() if add_s_loss is not None else 0,
                 "render_loss": render_loss.item() if render_loss is not None else 0
             })
 
-            print(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} | Rot Loss: {rot_loss.item():.4f}")
-
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = train_loss / train_sample
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f}")
 
         model.eval()
         valid_loss = 0.0
+        valid_sample = 0
         with torch.no_grad():
             for batch_idx, batch in enumerate(valid_loader):
                 if batch is None:
@@ -212,23 +189,55 @@ def main():
                 if batch_idx > 10:
                     break
 
-                x_dict_batch, Ks, R_gt, t_gt, instance_ids, cad_models, sample_indices = vectorize_training_batch(batch, device)
+                batch_avg_loss = []
+                batch_avg_render_loss = []
+                batch_avg_add_s_loss = []
 
-                loss, rot_loss, trans_loss, render_loss = model.compute_losses(
-                    x_dict_batch, Ks, cad_models, R_gt, t_gt, instance_ids, sample_indices
-                )
+                for sample in batch:
+                    if sample is None:
+                        continue
 
-                valid_loss += loss.item()
+                    x_dict_views = sample["views"]
+                    Ks = sample["K"].to(device)
+                    R_gt = [R.to(device) for R in sample["R_gt"]]
+                    t_gt = [t.to(device) for t in sample["t_gt"]]
+                    instance_ids = [int(i) for i in sample["instance_ids"]]
+                    cad_models = [(v.to(device), f.to(device)) for v, f in sample["cad_models"]]
+
+                    x_dict_views = [
+                        {mod: tensor.to(device) for mod, tensor in views.items()}
+                        for views in x_dict_views
+                    ]
+
+                    loss, render_loss, add_s_loss = model.compute_loss(
+                        x_dict_views=x_dict_views,
+                        K_list=Ks,
+                        cad_model_data=cad_models,
+                        R_gt_list=R_gt,
+                        t_gt_list=t_gt,
+                        instance_id_list=instance_ids
+                    )
+
+                    batch_avg_loss.append(loss)
+                    batch_avg_render_loss.append(render_loss.item())
+                    batch_avg_add_s_loss.append(add_s_loss.item())
+
+                avg_loss = torch.stack(batch_avg_loss).mean()  # keeps gradient + stays on GPU
+                batch_avg_render_loss = np.mean(batch_avg_render_loss)
+                batch_avg_add_s_loss = np.mean(batch_avg_add_s_loss)
+
+                valid_loss += batch_avg_loss.item()
+                valid_sample += 1
+
                 batch_valid_losses.append({
                     "epoch": epoch,
-                    "batch": batch_idx,
-                    "total_loss": loss.item(),
-                    "rot_loss": rot_loss.item(),
-                    "trans_loss": trans_loss.item(),
-                    "render_loss": render_loss.item() if render_loss is not None else 0
+                "batch": batch_idx,
+                "total_loss": batch_avg_loss,
+                "trans_loss": batch_avg_add_s_loss if batch_avg_add_s_loss is not None else 0,
+                "render_loss": batch_avg_render_loss if batch_avg_render_loss is not None else 0
                 })
 
-                print(f"[VAL] Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} | Rot Loss: {rot_loss.item():.4f}")
+                print(f"[VAL] Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} | ADD Loss: {add_s_loss.item():.4f}")
 
         avg_valid_loss = valid_loss / len(valid_loader)
         print(f"Validation Loss: {avg_valid_loss:.4f}")

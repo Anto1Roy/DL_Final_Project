@@ -58,13 +58,14 @@ class IPDDatasetMounted(Dataset):
         fid_key = str(int(frame_id))
         base_remote = f"{self.split}/{scene_id}"
 
-        x_dict = {modality: [] for modality in self.modalities}
+        x_dict_views = []  # List[Dict[str, Tensor]]
         Ks = []
         valid_views = []
 
         for cam_id in self.cam_ids:
-            view_modalities = []
+            view_dict = {}
             view_valid = True
+
             for modality in self.modalities:
                 if modality == "rgb":
                     remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.jpg"
@@ -72,17 +73,13 @@ class IPDDatasetMounted(Dataset):
                     remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
                 try:
                     img = self.read_img(remote_path, modality)
-                    x_dict[modality].append(img)
+                    view_dict[modality] = img
                 except Exception as e:
                     print(f"[WARN] Skipping cam {cam_id} for sample {idx} due to missing {modality} ({e})")
                     view_valid = False
                     break
 
             if not view_valid:
-                # remove incomplete view
-                for modality in self.modalities:
-                    if len(x_dict[modality]) > 0:
-                        x_dict[modality].pop()
                 continue
 
             try:
@@ -104,12 +101,11 @@ class IPDDatasetMounted(Dataset):
                     [0,     0,     1]
                 ], dtype=np.float32)
                 Ks.append(torch.tensor(K, dtype=torch.float32))
-
+                x_dict_views.append(view_dict)
                 valid_views.append(cam_id)
             except Exception as e:
                 print(f"[WARN] Camera intrinsics missing for cam {cam_id}: {e}")
 
-        # use first valid cam_id to get GT (assumes identical GT across views)
         if not valid_views:
             return None
 
@@ -134,7 +130,14 @@ class IPDDatasetMounted(Dataset):
 
         Ks = torch.stack(Ks)  # (V, 3, 3)
 
-        return x_dict, Ks, R_gt, t_gt, instance_ids, list(zip(verts_all, faces_all))
+        return {
+            "views": x_dict_views,               # List[Dict[str, Tensor]]
+            "K": Ks,                             # Tensor[V, 3, 3]
+            "R_gt": R_gt,                        # List[Tensor(3, 3)]
+            "t_gt": t_gt,                        # List[Tensor(3,)]
+            "instance_ids": instance_ids,        # List[int]
+            "cad_models": list(zip(verts_all, faces_all))  # List[(verts, faces)]
+        }
 
     def read_img(self, remote_path, modality):
         local_path = self.file_manager.get(remote_path)

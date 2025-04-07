@@ -13,10 +13,6 @@ class FuseNetFeatureEncoder(nn.Module):
         self.out_dim = ngf  # decoder output channels
 
     def forward(self, x_dict):
-        outputs = []
-        for view_idx in range(len(next(iter(x_dict.values())))):  # Iterate over views
-            x_dict_view = {modality: x_dict[modality][view_idx] for modality in x_dict}
-            x_latent, feats = self.encoder(x_dict_view)
-            decoded = self.decoder(x_latent, feats)  # (B, ngf, H, W)
-            outputs.append(decoded)
-        return outputs  # List of tensors, one per view
+        x_latent, feats = self.encoder(x_dict)
+        decoded = self.decoder(x_latent, feats)  # (B, ngf, H, W)
+        return decoded

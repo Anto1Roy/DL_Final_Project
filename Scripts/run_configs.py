@@ -6,7 +6,8 @@ def run_training(config_path):
     print(f"\n🚀 Running training with config: {config_path}\n")
     subprocess.run([
         sys.executable,
-        "Scripts/Training/E2E_training.py",
+        # "Scripts/Training/E2E_training.py",
+        "Scripts/Training/Pose_training.py",
         config_path
     ])
 

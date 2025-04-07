@@ -1,15 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import defaultdict
 
+from Models.MultiViewMatcher import MultiViewMatcher
 from Models.CozyPose import CosyPoseStyleRenderMatch
 from Models.CandidatePose import CandidatePoseModel
 from Models.ObjectDetection.FuseNet.FuseNet import FuseNetFeatureEncoder
-from Models.ObjectDetection.ResNet import ResNetFeatureEncoder  # or FuseNetFeatureEncoder if preferred
+from Models.ObjectDetection.ResNet import ResNetFeatureEncoder
+from Models.SceneRefinder import SceneRefiner
 from Models.helpers import quaternion_to_matrix
 
 def pose_distance(R1, t1, R2, t2):
-    """Compute a simple pose distance: rotation + translation norm"""
     rot_diff = torch.norm(R1 - R2)
     trans_diff = torch.norm(t1 - t2)
     return rot_diff + trans_diff
@@ -21,23 +23,20 @@ class TwoStagePoseEstimator(nn.Module):
         self.num_candidates = num_candidates
         self.noise_level = noise_level
         self.conf_thresh = conf_thresh
-
         self.out_dim = 64
 
         if encoder_type == "resnet":
             self.encoder = ResNetFeatureEncoder(modality=list(sensory_channels.keys())[0], out_dim=self.out_dim)
         elif encoder_type == "fusenet":
-            self.encoder = FuseNetFeatureEncoder(modality=list(sensory_channels.keys()), out_dim=self.out_dim)
+            self.encoder = FuseNetFeatureEncoder(sensory_channels=sensory_channels, ngf=self.out_dim)
 
         self.det_head = CandidatePoseModel(feature_dim=self.out_dim)
-        self.refiner = CosyPoseStyleRenderMatch(
-            renderer_config,
-            num_candidates=num_candidates,
-        )
+        self.refiner = CosyPoseStyleRenderMatch(renderer_config, num_candidates=num_candidates)
+        self.matcher = MultiViewMatcher(pose_threshold=0.1)
+        self.global_refiner = SceneRefiner(renderer_config)
 
-    # ----------- Stage 1: Single-View 6D Pose Estimation -----------
     def extract_single_view_features(self, x_dict):
-        return self.encoder(x_dict)  # (B, C, H, W)
+        return self.encoder(x_dict)
 
     def detect_single_view(self, feat_map, top_k=15):
         outputs = self.det_head.forward(feat_map)
@@ -47,17 +46,6 @@ class TwoStagePoseEstimator(nn.Module):
             for dets in detections_per_sample
         ]
         return filtered, outputs
-    
-     # ----------- Stage 2: Multi-View Pose Matching -----------
-    def match_detections_across_views(self, all_view_detections):
-        # NOT IMPLEMENTED: You need to define how to associate objects across views
-        # Could involve: object ID matching, appearance feature similarity, geometric constraints
-        return NotImplemented
-    
-    # ----------- Stage 3: Global Scene Refinement -----------
-    def global_scene_refinement(self):
-        # NOT IMPLEMENTED: Would involve bundle adjustment-like optimization
-        return NotImplemented
 
     def sample_candidates(self, detections):
         candidates_all = []
@@ -75,95 +63,139 @@ class TwoStagePoseEstimator(nn.Module):
             candidates_all.append(poses)
         return candidates_all
 
-    def score_candidates(self, feat_map, K, candidates_all, cad_model_lookup):
-        all_results = []
-        for obj_id, (cad_data, poses) in cad_model_lookup.items():
-            scores = self.refiner(
-                feat_map=feat_map,
-                cad_model_data_list=[cad_data],
-                candidate_pose_list=[poses],
-                instance_id_list=[obj_id],
-                K=K
-            )
-            all_results.extend(scores)
-        return all_results
-
-    def forward(self, x_dict, K, cad_model_lookup, top_k=100):
-        feat_map = self.extract_features(x_dict)
-        detections, _ = self.detect(feat_map, top_k=top_k)
-        candidates_per_det = self.sample_candidates(detections)
-
-        candidates_all = {id(poses): poses for poses in candidates_per_det}
-        results = self.score_candidates(feat_map, K, candidates_all, cad_model_lookup)
-        return results
-
-    def compute_losses(self, x_dict, K, cad_model_lookup, R_gt_tensor, t_gt_tensor, instance_id_list, sample_indices):
-        device = x_dict[next(iter(x_dict))].device
-        B = K.shape[0]  # batch size
-
-        # Extract features for the entire batch
-        feat_map = self.extract_features(x_dict)
-
-        # Detect poses for the entire batch
-        detections_per_sample, _ = self.detect(feat_map, top_k=25)  # List[List[dict]]
-
+    def match_gt_with_detections_across_views(self, detections_per_view, R_gt_tensor, t_gt_tensor, instance_id_list, sample_indices, feat_maps, Ks):
         matched_detections = []
         matched_gt_R, matched_gt_t, matched_ids, matched_feat, matched_K = [], [], [], [], []
 
+        objects_by_id = defaultdict(list)
         for i in range(len(sample_indices)):
             sample_idx = sample_indices[i].item()
+            obj_id = instance_id_list[i]
+            objects_by_id[obj_id].append((sample_idx, R_gt_tensor[i], t_gt_tensor[i]))
 
-            dets = detections_per_sample[sample_idx]
+        for obj_id, gt_info_list in objects_by_id.items():
+            for sample_idx, R_gt, t_gt in gt_info_list:
+                dets = detections_per_view[sample_idx]
+                best_match, best_dist = None, float('inf')
+                for det in dets:
+                    quat = det["quat"]
+                    t_pred = det["trans"]
+                    R_pred = quaternion_to_matrix(quat.unsqueeze(0))[0]
+                    dist = torch.norm(R_gt - R_pred) + torch.norm(t_gt - t_pred)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_match = det
+                if best_match is not None:
+                    matched_detections.append(best_match)
+                    matched_gt_R.append(R_gt)
+                    matched_gt_t.append(t_gt)
+                    matched_ids.append(obj_id)
+                    matched_feat.append(feat_maps[sample_idx])
+                    matched_K.append(Ks[sample_idx])
 
-            best_match, best_dist = None, float('inf')
-            for det in dets:
-                quat = det["quat"]
-                t_pred = det["trans"]
-                R_pred = quaternion_to_matrix(quat.unsqueeze(0))[0]
-                R_gt = R_gt_tensor[i]
-                t_gt = t_gt_tensor[i]
+        return matched_detections, matched_gt_R, matched_gt_t, matched_ids, matched_feat, matched_K
 
-                dist = torch.norm(R_gt - R_pred) + torch.norm(t_gt - t_pred)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_match = det
+    def compute_loss(self, x_dict_views, K_list, cad_model_data, R_gt_list, t_gt_list, instance_id_list):
+        """
+        Args:
+            x_dict_views: List[Dict[modality -> Tensor(C, H, W)]]
+            K_list: Tensor of shape (V, 3, 3)
+            cad_model_data: List of (verts, faces) per object
+            R_gt_list: List[Tensor(3, 3)]
+            t_gt_list: List[Tensor(3)]
+            instance_id_list: List[int]
+        """
 
-            if best_match is not None:
-                matched_detections.append(best_match)
-                matched_gt_R.append(R_gt_tensor[i])
-                matched_gt_t.append(t_gt_tensor[i])
-                matched_ids.append(instance_id_list[i])
-                matched_feat.append(feat_map[sample_idx])
-                matched_K.append(K[sample_idx])
+        # Stage 1: Feature extraction per view
+        feat_maps = [
+            self.extract_single_view_features(
+                {mod: view[mod].unsqueeze(0) for mod in view}
+            ) for view in x_dict_views
+        ]
 
-        if not matched_detections:
-            print("[WARN] No valid matches between detections and GT.")
-            return torch.tensor(0.0, device=device), 0.0, 0.0, 0.0
+        # Stage 2: Detection
+        detections_per_view = [self.detect_single_view(fm, top_k=25)[0][0] for fm in feat_maps]
 
-        # Sample candidate poses for each detection
-        candidates_all = self.sample_candidates(matched_detections)
+        # Stage 3: Multi-view hypothesis matching
+        object_groups = self.matcher.match(detections_per_view, feat_maps, K_list)
 
-        # Retrieve CAD models for each matched detection
-        cad_model_data_list = [cad_model_lookup[obj_id] for obj_id in matched_ids]
-
-        # Compute losses with refined poses
-        return self.refiner.compute_losses(
-            feat_maps=matched_feat,
-            cad_model_data_list=cad_model_data_list,
-            candidate_pose_list=candidates_all,
-            R_gt_list=matched_gt_R,
-            t_gt_list=matched_gt_t,
-            instance_id_list=matched_ids,
-            K_list=matched_K
+        # Stage 4: Refiner
+        total_loss, render_losses, add_s = self.global_refiner.compute_loss(
+            object_groups,
+            cad_model_lookup={obj_id: cad_model_data[i] for i, obj_id in enumerate(instance_id_list)},
+            gt_R_tensor=torch.stack(R_gt_list) if R_gt_list else None,
+            gt_t_tensor=torch.stack(t_gt_list) if t_gt_list else None,
+            instance_id_list=instance_id_list
         )
+
+        return total_loss, render_losses, add_s
     
+    def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, K_list):
+        feat_maps = [self.extract_single_view_features({mod: view[mod].unsqueeze(0) for mod in view}) for view in x_dict_views]
+        dets_per_view = [self.detect_single_view(fm, top_k=1)[0][0] for fm in feat_maps]
+
+        rot_losses = []
+        trans_losses = []
+
+        for i, dets in enumerate(dets_per_view):
+            if not dets:
+                continue
+            pred_R = quaternion_to_matrix(dets[0]['quat'].unsqueeze(0))
+            pred_t = dets[0]['trans']
+
+            gt_R = R_gt_list[i].unsqueeze(0)
+            gt_t = t_gt_list[i]
+
+            rot_loss = torch.norm(gt_R - pred_R)
+            trans_loss = torch.norm(gt_t - pred_t)
+
+            rot_losses.append(rot_loss)
+            trans_losses.append(trans_loss)
+
+        if len(rot_losses) == 0:
+            zero = torch.tensor(0.0, device=feat_maps[0].device, requires_grad=True)
+            return zero, zero, zero
+
+        rot_stack = torch.stack(rot_losses)
+        trans_stack = torch.stack(trans_losses)
+        total_loss = rot_stack.mean() + trans_stack.mean()
+
+        return total_loss, rot_stack.mean(), trans_stack.mean()
+
+        
+
+    def forward(self, x_dict_list, K_list, cad_model_lookup, top_k=100):
+        # Stage 1: extract features + detections
+        feat_maps = [self.extract_single_view_features(x_dict) for x_dict in x_dict_list]
+        detections_per_view = [self.detect_single_view(f, top_k=top_k)[0][0] for f in feat_maps]
+
+        print("Detections per view:")
+        for i, dets in enumerate(detections_per_view):
+            print(f"View {i}: {len(dets)} detections")
+
+        # Stage 2: match multi-view object hypotheses
+        object_groups = self.matcher.match(detections_per_view, feat_maps, K_list)
+
+        print("Object groups after matching:")
+        for i, group in enumerate(object_groups):
+            print(f"Group {i}: {len(group)} detections")
+
+        # Stage 3: refine the scene globally
+        refined_poses, rendered_views = self.global_refiner(object_groups, cad_model_lookup)
+
+        print("Refined poses and rendered views:")
+        for i, (pose, view) in enumerate(zip(refined_poses, rendered_views)):
+            print(f"Pose {i}: {pose}")
+            print(f"View {i}: {view}")
+
+        return object_groups, refined_poses, rendered_views 
+
     def freeze_refiner(self):
         for param in self.refiner.parameters():
             param.requires_grad = False
-    
+
     def freeze_encoder(self):
         for param in self.encoder.parameters():
             param.requires_grad = False
         for param in self.det_head.parameters():
-                param.requires_grad = False
-
+            param.requires_grad = False

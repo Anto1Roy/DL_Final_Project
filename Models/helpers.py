@@ -67,3 +67,42 @@ class Conv_residual_conv(nn.Module):
         res = conv_1 + conv_2
         conv_3 = self.conv_3(res)
         return conv_3
+
+def compute_add_s(pred_R, pred_t, gt_R, gt_t, model_points, sym_permutations=None, reduction='mean'):
+    """
+    Computes ADD-S (Average Distance of model points - Symmetric) between predicted and GT poses.
+    
+    Args:
+        pred_R (B, 3, 3): predicted rotation matrix
+        pred_t (B, 3): predicted translation vector
+        gt_R (B, 3, 3): ground truth rotation matrix
+        gt_t (B, 3): ground truth translation vector
+        model_points (B, N, 3): model points in object space
+        sym_permutations (optional): list of (B, N, 3) tensors representing symmetrical variants
+        reduction: 'mean' or 'none'
+
+    Returns:
+        add_s (B,): per-object ADD-S distances
+    """
+    B, N, _ = model_points.shape
+
+    # Transform model points using predicted and GT poses
+    pred_pts = (pred_R @ model_points.transpose(1, 2)).transpose(1, 2) + pred_t[:, None, :]  # (B, N, 3)
+    gt_pts = (gt_R @ model_points.transpose(1, 2)).transpose(1, 2) + gt_t[:, None, :]        # (B, N, 3)
+
+    if sym_permutations is None:
+        # Euclidean distance per point
+        dists = torch.norm(pred_pts - gt_pts, dim=-1)  # (B, N)
+        add_s = dists.mean(dim=-1)                     # (B,)
+    else:
+        min_dists = []
+        for sym in sym_permutations:  # sym: (B, N, 3)
+            sym_pts = (gt_R @ sym.transpose(1, 2)).transpose(1, 2) + gt_t[:, None, :]
+            dist = torch.cdist(pred_pts, sym_pts, p=2)  # (B, N, N)
+            min_dist = dist.min(dim=-1)[0]              # (B, N)
+            min_dists.append(min_dist.mean(dim=-1))     # list of (B,)
+        add_s = torch.stack(min_dists, dim=1).min(dim=1)[0]  # (B,)
+
+    if reduction == 'mean':
+        return add_s.mean()
+    return add_s

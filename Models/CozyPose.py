@@ -102,6 +102,8 @@ class CosyPoseStyleRenderMatch(nn.Module):
             K_list=K_list
         )
 
+        print("Forward pass completed.")
+
         # Rotation and Translation Losses
         rot_loss = F.mse_loss(R_pred, R_gt_tensor)
         trans_loss = F.mse_loss(t_pred, t_gt_tensor)
