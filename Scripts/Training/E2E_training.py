@@ -27,24 +27,60 @@ def custom_collate_fn(batch):
     return batch
 
 def vectorize_training_batch(batch, device):
-    x_dicts = [b[0] for b in batch]
-    Ks = [b[1].to(device) for b in batch]
-    R_gt_lists = [b[2] for b in batch]
-    t_gt_lists = [b[3] for b in batch]
-    instance_ids_lists = [b[4] for b in batch]
-    cad_model_data_lists = [b[5] for b in batch]
+    """
+    Handles multi-view + multi-modality batches.
+    Each sample in the batch contains:
+        - x_dict: modality -> List[Tensor] (one per view)
+        - Ks: (V, 3, 3) tensor
+        - R_gt: List[Tensor]
+        - t_gt: List[Tensor]
+        - instance_ids: List[int]
+        - cad_models: List[(verts, faces)]
+    
+    Returns:
+        x_dict_views: modality -> Tensor of shape (B, V, C, H, W)
+        Ks_views: (B, V, 3, 3)
+        R_gt_all: (M, 3, 3)
+        t_gt_all: (M, 3)
+        instance_ids_all: List[int]
+        cad_models_all: List[(verts, faces)]
+        sample_indices_all: (M,) tensor mapping objects to their sample
+    """
+    B = len(batch)
+    modalities = batch[0][0].keys()
+    V = len(batch[0][0][next(iter(modalities))])  # number of views
 
-    x_dict_batch = {
-        k: torch.stack([d[k] for d in x_dicts]).to(device).to(torch.float16)
-        for k in x_dicts[0].keys()
-    }
-    for i in range(len(batch)):
-        R_gt_lists[i] = [r.to(device) for r in R_gt_lists[i]]
-        t_gt_lists[i] = [t.to(device) for t in t_gt_lists[i]]
-        instance_ids_lists[i] = [int(id) for id in instance_ids_lists[i]]
-        cad_model_data_lists[i] = [(verts.to(device), faces.to(device)) for verts, faces in cad_model_data_lists[i]]
+    # Init modality-wise storage
+    x_dict_views = {mod: [] for mod in modalities}
+    Ks_views = []
 
-    return x_dict_batch, Ks, R_gt_lists, t_gt_lists, instance_ids_lists, cad_model_data_lists
+    R_gt_all, t_gt_all = [], []
+    instance_ids_all, cad_models_all, sample_indices_all = [], [], []
+
+    for sample_idx, (x_dict, Ks, R_list, t_list, id_list, cad_list) in enumerate(batch):
+        # Append per-view modalities
+        for mod in modalities:
+            # List[Tensor(V, C, H, W)] → append one sample of V tensors
+            x_dict_views[mod].append(torch.stack(x_dict[mod]).to(device).to(torch.float16))  # (V, C, H, W)
+
+        Ks_views.append(Ks.to(device))  # (V, 3, 3)
+
+        for i in range(len(id_list)):
+            R_gt_all.append(R_list[i].to(device))
+            t_gt_all.append(t_list[i].to(device))
+            instance_ids_all.append(int(id_list[i]))
+            cad_models_all.append((cad_list[i][0].to(device), cad_list[i][1].to(device)))
+            sample_indices_all.append(sample_idx)
+
+    # Stack per modality to shape (B, V, C, H, W)
+    x_dict_views = {mod: torch.stack(x_dict_views[mod]) for mod in modalities}
+    Ks_views = torch.stack(Ks_views)  # (B, V, 3, 3)
+
+    R_gt_all = torch.stack(R_gt_all)
+    t_gt_all = torch.stack(t_gt_all)
+    sample_indices_all = torch.tensor(sample_indices_all, device=device)
+
+    return x_dict_views, Ks_views, R_gt_all, t_gt_all, instance_ids_all, cad_models_all, sample_indices_all
 
 def load_checkpoint(filepath, model, optimizer, scaler, scheduler):
     if os.path.exists(filepath):
@@ -136,12 +172,15 @@ def main():
             if batch is None:
                 continue
 
-            x_dict_batch, Ks_flat, R_gt_flat, t_gt_flat, instance_ids_flat, cad_models_flat = vectorize_training_batch(batch, device)
+            if batch_idx > 20:
+                break
+
+            x_dict_batch, Ks, R_gt, t_gt, instance_ids, cad_models, sample_indices = vectorize_training_batch(batch, device)
 
             optimizer.zero_grad()
             with autocast():
                 loss, rot_loss, trans_loss, render_loss = model.compute_losses(
-                    x_dict_batch, Ks_flat, cad_models_flat, R_gt_flat, t_gt_flat, instance_ids_flat
+                    x_dict_batch, Ks, cad_models, R_gt, t_gt, instance_ids, sample_indices
                 )
 
             scaler.scale(loss).backward()
@@ -170,10 +209,13 @@ def main():
                 if batch is None:
                     continue
 
-                x_dict_batch, Ks_flat, R_gt_flat, t_gt_flat, instance_ids_flat, cad_models_flat = vectorize_training_batch(batch, device)
+                if batch_idx > 10:
+                    break
+
+                x_dict_batch, Ks, R_gt, t_gt, instance_ids, cad_models, sample_indices = vectorize_training_batch(batch, device)
 
                 loss, rot_loss, trans_loss, render_loss = model.compute_losses(
-                    x_dict_batch, Ks_flat, cad_models_flat, R_gt_flat, t_gt_flat, instance_ids_flat
+                    x_dict_batch, Ks, cad_models, R_gt, t_gt, instance_ids, sample_indices
                 )
 
                 valid_loss += loss.item()

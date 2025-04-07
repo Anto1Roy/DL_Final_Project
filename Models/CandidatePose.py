@@ -31,6 +31,7 @@ class CandidatePoseModel(nn.Module):
             flat_conf = conf[b].reshape(-1)
             topk_vals, topk_idx = flat_conf.topk(top_k)
 
+            sample_results = []
             for i in range(top_k):
                 idx = topk_idx[i].item()
                 h = idx // W
@@ -43,11 +44,14 @@ class CandidatePoseModel(nn.Module):
                 pose_mat[:3, :3] = quaternion_to_matrix(q.unsqueeze(0))[0]
                 pose_mat[:3, 3] = t
 
-                results.append({
+                sample_results.append({
                     "quat": q,
                     "trans": t,
                     "score": topk_vals[i].item(),
                     "pose_matrix": pose_mat
                 })
 
-        return results
+            results.append(sample_results) 
+
+        return results  
+

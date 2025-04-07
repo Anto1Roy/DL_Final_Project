@@ -35,13 +35,29 @@ class TwoStagePoseEstimator(nn.Module):
             num_candidates=num_candidates,
         )
 
-    def extract_features(self, x_dict):
-        return self.encoder(x_dict)
+    # ----------- Stage 1: Single-View 6D Pose Estimation -----------
+    def extract_single_view_features(self, x_dict):
+        return self.encoder(x_dict)  # (B, C, H, W)
 
-    def detect(self, feat_map, top_k=15):
+    def detect_single_view(self, feat_map, top_k=15):
         outputs = self.det_head.forward(feat_map)
-        detections = self.det_head.decode_poses(outputs, top_k=top_k)
-        return [d for d in detections if d["score"] >= self.conf_thresh], outputs
+        detections_per_sample = self.det_head.decode_poses(outputs, top_k=top_k)
+        filtered = [
+            [d for d in dets if d["score"] >= self.conf_thresh]
+            for dets in detections_per_sample
+        ]
+        return filtered, outputs
+    
+     # ----------- Stage 2: Multi-View Pose Matching -----------
+    def match_detections_across_views(self, all_view_detections):
+        # NOT IMPLEMENTED: You need to define how to associate objects across views
+        # Could involve: object ID matching, appearance feature similarity, geometric constraints
+        return NotImplemented
+    
+    # ----------- Stage 3: Global Scene Refinement -----------
+    def global_scene_refinement(self):
+        # NOT IMPLEMENTED: Would involve bundle adjustment-like optimization
+        return NotImplemented
 
     def sample_candidates(self, detections):
         candidates_all = []
@@ -81,64 +97,73 @@ class TwoStagePoseEstimator(nn.Module):
         results = self.score_candidates(feat_map, K, candidates_all, cad_model_lookup)
         return results
 
-    def compute_losses(self, x_dict, K, cad_model_lookup, R_gt_list, t_gt_list, instance_id_list):
+    def compute_losses(self, x_dict, K, cad_model_lookup, R_gt_tensor, t_gt_tensor, instance_id_list, sample_indices):
+        device = x_dict[next(iter(x_dict))].device
+        B = K.shape[0]  # batch size
+
         # Extract features for the entire batch
         feat_map = self.extract_features(x_dict)
-        
-        # Detect the top_k detections for each sample in the batch
-        detections, _ = self.detect(feat_map, top_k=25)  # List of lists of detections, one per sample
-        
-        matched_detections, matched_gt_R, matched_gt_t, matched_ids = [], [], [], []
-        used_indices = set()
 
-        # Iterate over the batch (one sample at a time)
-        for i in range(len(R_gt_list)):
-            R_gt = R_gt_list[i]
-            t_gt = t_gt_list[i]
-            obj_id = instance_id_list[i]
+        # Detect poses for the entire batch
+        detections_per_sample, _ = self.detect(feat_map, top_k=25)  # List[List[dict]]
 
-            # Get the detections for the current sample (i)
-            sample_detections = detections[i]  # List of detections for sample i
-            
-            best_match, best_dist = None, float("inf")
-            
-            # Compare GT with the detections of the current sample
-            for j, det in enumerate(sample_detections):
-                if j in used_indices:
-                    continue
-                dist = pose_distance(
-                    quaternion_to_matrix(det["quat"].unsqueeze(0))[0], det["trans"], R_gt, t_gt
-                )
+        matched_detections = []
+        matched_gt_R, matched_gt_t, matched_ids, matched_feat, matched_K = [], [], [], [], []
+
+        for i in range(len(sample_indices)):
+            sample_idx = sample_indices[i].item()
+
+            dets = detections_per_sample[sample_idx]
+
+            best_match, best_dist = None, float('inf')
+            for det in dets:
+                quat = det["quat"]
+                t_pred = det["trans"]
+                R_pred = quaternion_to_matrix(quat.unsqueeze(0))[0]
+                R_gt = R_gt_tensor[i]
+                t_gt = t_gt_tensor[i]
+
+                dist = torch.norm(R_gt - R_pred) + torch.norm(t_gt - t_pred)
                 if dist < best_dist:
-                    best_match = (j, det)
                     best_dist = dist
-            
-            if best_match:
-                j, matched = best_match
-                used_indices.add(j)
-                matched_detections.append(matched)
-                matched_gt_R.append(R_gt)
-                matched_gt_t.append(t_gt)
-                matched_ids.append(obj_id)
+                    best_match = det
 
-        # If no valid detections were matched, return 0 loss
+            if best_match is not None:
+                matched_detections.append(best_match)
+                matched_gt_R.append(R_gt_tensor[i])
+                matched_gt_t.append(t_gt_tensor[i])
+                matched_ids.append(instance_id_list[i])
+                matched_feat.append(feat_map[sample_idx])
+                matched_K.append(K[sample_idx])
+
         if not matched_detections:
             print("[WARN] No valid matches between detections and GT.")
-            return torch.tensor(0.0, device=x_dict[next(iter(x_dict))].device), 0.0, 0.0, 0.0
+            return torch.tensor(0.0, device=device), 0.0, 0.0, 0.0
 
-        # Sample candidate poses for the matched detections
+        # Sample candidate poses for each detection
         candidates_all = self.sample_candidates(matched_detections)
-        
-        # Create the cad_model_data_list for each matched detection in the batch
+
+        # Retrieve CAD models for each matched detection
         cad_model_data_list = [cad_model_lookup[obj_id] for obj_id in matched_ids]
-        
-        # Call the refiner's compute_losses for batch processing
+
+        # Compute losses with refined poses
         return self.refiner.compute_losses(
-            feat_map=feat_map,
+            feat_maps=matched_feat,
             cad_model_data_list=cad_model_data_list,
             candidate_pose_list=candidates_all,
             R_gt_list=matched_gt_R,
             t_gt_list=matched_gt_t,
             instance_id_list=matched_ids,
-            K=K
+            K_list=matched_K
         )
+    
+    def freeze_refiner(self):
+        for param in self.refiner.parameters():
+            param.requires_grad = False
+    
+    def freeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        for param in self.det_head.parameters():
+                param.requires_grad = False
+

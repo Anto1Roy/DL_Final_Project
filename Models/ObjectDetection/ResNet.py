@@ -28,6 +28,10 @@ class ResNetFeatureEncoder(nn.Module):
         self.out_dim = out_dim
 
     def forward(self, x_dict):
-        x = x_dict[self.modality]  # (B, C, H, W)
-        feat = self.feature_extractor(x)
-        return self.out_proj(feat)  # (B, out_dim, H', W')
+        outputs = []
+        for view_idx in range(len(x_dict[self.modality])):  # Iterate over views
+            x = x_dict[self.modality][view_idx]  # (B, C, H, W)
+            feat = self.feature_extractor(x)
+            projected_feat = self.out_proj(feat)  # (B, out_dim, H', W')
+            outputs.append(projected_feat)
+        return outputs  # List of tensors, one per view

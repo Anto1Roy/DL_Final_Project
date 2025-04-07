@@ -28,7 +28,7 @@ class KaolinRenderer(nn.Module):
         world2cam[:3, 3] = -cam_rot.T @ cam_pos
 
         if K is not None:
-            proj = self.build_projection_from_K(K)
+            proj = self.build_projection_from_K(K.squeeze(0))
         else:
             proj = self.get_projection_matrix(self.fov, near=0.01, far=10.0).to(self.device)
 

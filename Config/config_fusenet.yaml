@@ -1,6 +1,6 @@
 dataset:
   remote_base_url: ipd_data/ipd
-  cam_ids: [cam2]
+  cam_ids: [cam1, cam2]
   modality: [rgb, depth] #, aolp, dolp]
   train_split: train_pbr
   val_split: val
@@ -17,7 +17,7 @@ training:
   freeze_refiner: false
 
 optim:
-  lr: 1e-4
+  lr: 5e-4
   weight_decay: 0.0
 
 renderer:
