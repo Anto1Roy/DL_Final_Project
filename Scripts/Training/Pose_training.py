@@ -14,6 +14,31 @@ sys.path.append(os.getcwd())
 from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Models.PoseEstimator import TwoStagePoseEstimator
 
+def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="checkpoint.pth"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scaler_state': scaler.state_dict()
+    }, path)
+    print(f"[INFO] Saved checkpoint to {path}")
+
+
+def load_checkpoint(model, optimizer, scaler, path="checkpoint.pth"):
+    if os.path.exists(path):
+        checkpoint = torch.load(path)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scaler.load_state_dict(checkpoint["scaler_state"])
+        print(f"[INFO] Loaded checkpoint from {path}")
+        return checkpoint["epoch"], checkpoint.get("batch_idx", 0)
+    else:
+        print(f"[INFO] No checkpoint found at {path}. Starting from scratch.")
+        return 0, 0
+
+
 def custom_collate_fn(batch):
     return [sample for sample in batch if sample is not None]
 
@@ -44,6 +69,7 @@ def main():
 
     train_obj_ids = {0, 8, 18, 19, 20}
     test_obj_ids = {1, 4, 10, 11, 14}
+    
 
     dataset = IPDDatasetMounted(remote_base_url, cam_ids, modalities, split=train_split,
                                  allowed_obj_ids=train_obj_ids, allowed_scene_ids=train_scene_ids)
@@ -72,10 +98,13 @@ def main():
     model.freeze_refiner()  # Only train stage 1
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
     scaler = GradScaler()
 
+    start_epoch, start_batch_idx = load_checkpoint(model, optimizer, scaler, path=f"weights/checkpoint_pose.pth")
+
     print("\n------ Stage 1 Pose Training ------")
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         total_trans_loss = 0.0
         total_rot_loss = 0.0
@@ -90,13 +119,12 @@ def main():
 
             index += 1
 
-            if index > 10000:
-                break
-
             optimizer.zero_grad()
 
             trans_loss_avg = 0.0
             rot_loss_avg = 0.0
+
+            batch_avg_loss = []
 
             for sample in batch:
                 x_dict_views = sample["views"]
@@ -118,12 +146,13 @@ def main():
                     trans_loss_avg += trans_loss.item()
                     rot_loss_avg += rot_loss.item()
                     
-                    scaler.scale(total_loss).backward()
+                    batch_avg_loss.append(total_loss)
                     total_samples += 1
 
                     batch_rot_loss.append(rot_loss.item())
                     batch_trans_loss.append(trans_loss.item())
 
+            avg_loss = torch.stack(batch_avg_loss).mean()  # keeps gradient + stays on GPU
             total_rot_loss += rot_loss_avg
             total_trans_loss += trans_loss_avg
 
@@ -132,8 +161,13 @@ def main():
             batch_trans_loss.append(trans_loss_avg/len(batch))
             batch_rot_loss.append(rot_loss_avg/len(batch))
 
+            scaler.scale(avg_loss).backward()
             scaler.step(optimizer)
+            scheduler.step(avg_loss)
             scaler.update()
+
+            if index % 1000 == 0:
+                save_checkpoint(model, optimizer, scaler, epoch, index, path=f"weights/checkpoint_pose.pth")
 
         avg_rot_loss = total_rot_loss / total_samples
         avg_trans_loss = total_trans_loss / total_samples

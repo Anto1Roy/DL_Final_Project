@@ -12,12 +12,12 @@ training:
   num_workers: 2
   device: cuda
   patience: 10
-  encoder: resnet
+  encoder: fusenet #resnet
   freeze_candidates: false
   freeze_refiner: false
 
 optim:
-  lr: 5e-4
+  lr: 1e-4
   weight_decay: 0.0
 
 renderer:
