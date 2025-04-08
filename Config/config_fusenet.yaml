@@ -1,6 +1,6 @@
 dataset:
   remote_base_url: ipd_data/ipd
-  cam_ids: [cam1, cam2]
+  cam_ids: [cam1, cam2, cam3]
   modality: [rgb, depth] #, aolp, dolp]
   train_split: train_pbr
   val_split: val
@@ -13,8 +13,11 @@ training:
   device: cuda
   patience: 10
   encoder: fusenet #resnet
+  fusion: "concat"
   freeze_candidates: false
   freeze_refiner: false
+  checkpoint_index: 400
+  val_every: 10
 
 optim:
   lr: 1e-4
@@ -24,4 +27,4 @@ renderer:
   width: 640
   height: 480
   device: cuda
-  render_weight: 1.0
+  #render_weight: 1.0

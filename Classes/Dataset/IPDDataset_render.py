@@ -58,7 +58,7 @@ class IPDDatasetMounted(Dataset):
         fid_key = str(int(frame_id))
         base_remote = f"{self.split}/{scene_id}"
 
-        x_dict_views = []  # List[Dict[str, Tensor]]
+        x_dict_views = []
         Ks = []
         valid_views = []
 
@@ -67,77 +67,79 @@ class IPDDatasetMounted(Dataset):
             view_valid = True
 
             for modality in self.modalities:
-                if modality == "rgb":
-                    remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.jpg"
-                else:
-                    remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.png"
+                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.{'jpg' if modality == 'rgb' else 'png'}"
                 try:
-                    img = self.read_img(remote_path, modality)
-                    view_dict[modality] = img
-                except Exception as e:
-                    print(f"[WARN] Skipping cam {cam_id} for sample {idx} due to missing {modality} ({e})")
+                    view_dict[modality] = self.read_img(remote_path, modality)
+                except Exception:
                     view_valid = False
                     break
 
-            if not view_valid:
-                continue
+            if view_valid:
+                try:
+                    cam_idx = int(cam_id.replace("cam", ""))
+                    cam_cfg = json.load(open(self.file_manager.get(f"ipd/camera_cam{cam_idx}.json")))
+                    fx, fy, cx, cy = cam_cfg["fx"], cam_cfg["fy"], cam_cfg["cx"], cam_cfg["cy"]
+                    W_orig, H_orig = cam_cfg["width"], cam_cfg["height"]
+                    W_new, H_new = self.img_size
+                    scale_x, scale_y = W_new / W_orig, H_new / H_orig
 
-            try:
-                cam_idx = int(cam_id.replace("cam", ""))
-                local_cam_json = self.file_manager.get(f"ipd/camera_cam{cam_idx}.json")
-                with open(local_cam_json) as f:
-                    cam_cfg = json.load(f)
+                    K = torch.tensor([
+                        [fx * scale_x, 0, cx * scale_x],
+                        [0, fy * scale_y, cy * scale_y],
+                        [0, 0, 1]
+                    ], dtype=torch.float32)
 
-                fx, fy = cam_cfg["fx"], cam_cfg["fy"]
-                cx, cy = cam_cfg["cx"], cam_cfg["cy"]
-                W_orig, H_orig = cam_cfg["width"], cam_cfg["height"]
-                W_new, H_new = self.img_size
-                scale_x = W_new / W_orig
-                scale_y = H_new / H_orig
+                    Ks.append(K)
+                    x_dict_views.append(view_dict)
+                    valid_views.append(cam_id)
+                except Exception:
+                    continue
 
-                K = np.array([
-                    [fx * scale_x, 0,     cx * scale_x],
-                    [0,     fy * scale_y, cy * scale_y],
-                    [0,     0,     1]
-                ], dtype=np.float32)
-                Ks.append(torch.tensor(K, dtype=torch.float32))
-                x_dict_views.append(view_dict)
-                valid_views.append(cam_id)
-            except Exception as e:
-                print(f"[WARN] Camera intrinsics missing for cam {cam_id}: {e}")
-
-        if not valid_views:
+        if len(x_dict_views) != len(self.cam_ids):
             return None
 
-        primary_cam = valid_views[0]
-        local_gt_json = self.file_manager.get(f"{base_remote}/scene_gt_{primary_cam}.json")
-        with open(local_gt_json) as f:
-            gt_all = json.load(f)[fid_key]
+        Ks = torch.stack(Ks)
 
-        R_gt, t_gt, instance_ids, verts_all, faces_all = [], [], [], [], []
+        # === Ground truth ===
+        primary_cam = valid_views[0]
+        gt_all = json.load(open(self.file_manager.get(f"{base_remote}/scene_gt_{primary_cam}.json")))[fid_key]
+
+        gt_poses = []
+        available_cads = []
+
         for obj in gt_all:
             obj_id = obj["obj_id"]
             R = torch.tensor(obj["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
             t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
-            R_gt.append(R)
-            t_gt.append(t)
+            instance_id = obj.get("instance_id", obj_id)  # optional, fallback to obj_id
+
+            gt_poses.append({
+                "R": R,
+                "t": t,
+                "obj_id": obj_id,
+                "instance_id": instance_id,
+            })
 
             model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
             mesh = trimesh.load(model_path, process=False)
-            verts_all.append(torch.tensor(mesh.vertices, dtype=torch.float32))
-            faces_all.append(torch.tensor(mesh.faces, dtype=torch.long))
-            instance_ids.append(obj_id)
 
-        Ks = torch.stack(Ks)  # (V, 3, 3)
+            available_cads.append({
+                "obj_id": obj_id,
+                "verts": torch.tensor(mesh.vertices, dtype=torch.float32),
+                "faces": torch.tensor(mesh.faces, dtype=torch.long),
+            })
 
         return {
-            "views": x_dict_views,               # List[Dict[str, Tensor]]
-            "K": Ks,                             # Tensor[V, 3, 3]
-            "R_gt": R_gt,                        # List[Tensor(3, 3)]
-            "t_gt": t_gt,                        # List[Tensor(3,)]
-            "instance_ids": instance_ids,        # List[int]
-            "cad_models": list(zip(verts_all, faces_all))  # List[(verts, faces)]
+            "X": {
+                "views": x_dict_views,
+                "K": Ks,
+                "available_cads": available_cads,
+            },
+            "Y": {
+                "gt_poses": gt_poses
+            }
         }
+
 
     def read_img(self, remote_path, modality):
         local_path = self.file_manager.get(remote_path)

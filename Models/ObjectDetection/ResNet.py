@@ -3,7 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 
 class ResNetFeatureEncoder(nn.Module):
-    def __init__(self, modality="rgb", out_dim=64, backbone="resnet18"):
+    def __init__(self, modality="rgb", out_dim=64, backbone="resnet34"):
         super().__init__()
 
         resnet_fn = getattr(models, backbone)
