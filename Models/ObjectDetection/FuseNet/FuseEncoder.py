@@ -26,15 +26,7 @@ class FuseEncoder(nn.Module):
                 Conv_residual_conv(ngf * 2, ngf * 4, self.act_fn),
                 Conv_residual_conv(ngf * 4, ngf * 8, self.act_fn),
             ])
-        self.pools = nn.ModuleList([maxpool() for _ in range(5)])
-
-        # Fusion layers (learnable 1x1 convs after concat)
-        self.fusion_convs = nn.ModuleList([
-            nn.Conv2d(len(self.modalities) * ngf, ngf, kernel_size=1),
-            nn.Conv2d(len(self.modalities) * ngf * 2, ngf * 2, kernel_size=1),
-            nn.Conv2d(len(self.modalities) * ngf * 4, ngf * 4, kernel_size=1),
-            nn.Conv2d(len(self.modalities) * ngf * 8, ngf * 8, kernel_size=1),
-        ])
+        self.pools = nn.ModuleList([maxpool() for _ in range(4)])
 
         self.bridge = Conv_residual_conv(ngf * 8, ngf * 16, self.act_fn)
 
@@ -47,17 +39,16 @@ class FuseEncoder(nn.Module):
             level_feats = []
             for mod in self.modalities:
                 if i == 0:
-                    f = self.encoders[mod][i](x_dict[mod])
+                    f = self.encoders[mod][i](x_dict[mod].unsqueeze(0))
                 else:
                     f = self.encoders[mod][i](self.pools[i - 1](mod_feats[mod]))
                 level_feats.append(f)
                 mod_feats[mod] = f
 
-            # Concatenate along channel dim
-            x_cat = torch.cat(level_feats, dim=1)  # [B, num_modalities * C, H, W]
-            x_fused = self.fusion_convs[i](x_cat)  # [B, C, H, W]
+            # use sum because concat fusion is too heavy
+            x_fused = sum(level_feats) / len(level_feats)
             feats.append(x_fused)
 
-        x = self.pools[4](x_fused)
+        x = self.pools[3](x_fused)
         x = self.bridge(x)
         return x, feats

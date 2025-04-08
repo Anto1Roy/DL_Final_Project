@@ -1,5 +1,8 @@
+# --- Updated PoseEstimator with multi-object descriptor loss ---
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from Models.CosyPose.CandidatePose import CandidatePoseModel
@@ -21,7 +24,8 @@ class PoseEstimator(nn.Module):
         fusion_type=None,
         num_candidates=32,
         noise_level=0.05,
-        conf_thresh=0.5
+        conf_thresh=0.5,
+        lambda_desc=1.0
     ):
         super().__init__()
         self.num_candidates = num_candidates
@@ -29,6 +33,7 @@ class PoseEstimator(nn.Module):
         self.conf_thresh = conf_thresh
         self.out_dim = 16
         self.fusion_type = fusion_type
+        self.lambda_desc = lambda_desc
 
         # Feature encoder
         if encoder_type == "resnet":
@@ -66,24 +71,25 @@ class PoseEstimator(nn.Module):
         else:
             fused_map = torch.cat(feat_maps, dim=1)
 
-        detections, _ = self.detect(fused_map, cad_model_lookup, top_k=top_k)
-        return detections
+        detections, outputs = self.detect(fused_map, cad_model_lookup, top_k=top_k)
+        return detections, outputs
 
     def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, K_list, cad_model_lookup):
         device = K_list[0].device
 
+        # Create class embeddings
         class_embeddings = {
             obj_id: self.embed_model(
                 item["verts"], item["faces"],
-                R=torch.eye(3, device=device),              # (3, 3)
-                T=torch.zeros(3, device=device),            # (3,)
-                K=K_list[0] if K_list is not None else None # (3, 3)
+                R=torch.eye(3, device=device),
+                T=torch.zeros(3, device=device),
+                K=K_list[0] if K_list is not None else None
             )
             for obj_id, item in cad_model_lookup.items()
         }
 
-        # Forward pass
-        detections_batch = self.forward(x_dict_views, K_list=K_list, cad_model_lookup=class_embeddings, top_k=15)
+        # Forward pass with outputs
+        detections_batch, outputs = self.forward(x_dict_views, K_list=K_list, cad_model_lookup=class_embeddings, top_k=15)
 
         if len(detections_batch) == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -100,29 +106,29 @@ class PoseEstimator(nn.Module):
         gt_Rs = torch.stack(R_gt_list).to(device)
         gt_ts = torch.stack(t_gt_list).to(device)
 
-        # Matching predictions to ground truth using Hungarian algorithm
+        # Hungarian matching
         rot_diff = torch.cdist(gt_Rs.view(len(gt_Rs), -1), pred_Rs.view(len(pred_Rs), -1))
         trans_diff = torch.cdist(gt_ts, pred_ts)
         cost_matrix = (rot_diff + trans_diff).detach().cpu().numpy()
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-        # Final pose losses
+        # Pose loss
         losses_rot = torch.stack([rot_diff[i, j] for i, j in zip(row_ind, col_ind)])
         losses_trans = torch.stack([trans_diff[i, j] for i, j in zip(row_ind, col_ind)])
-        total_loss = losses_rot.mean() + losses_trans.mean()
+        pose_loss_val = losses_rot.mean() + losses_trans.mean()
 
+        # Multi-object descriptor loss
+        pred_embed = outputs["embed"]  # [B, D, H, W]
         desc_losses = []
-
         for obj_id, obj_embed in class_embeddings.items():
             gt_embedding = obj_embed.view(1, -1, 1, 1)  # [1, D, 1, 1]
-            similarity_map = F.cosine_similarity(pred_embed, gt_embedding, dim=1)  # [B, H, W]
-            
-            topk_sim, _ = similarity_map.view(similarity_map.shape[0], -1).topk(500, dim=1)
+            sim_map = F.cosine_similarity(pred_embed, gt_embedding, dim=1)  # [B, H, W]
+            topk_sim, _ = sim_map.view(sim_map.shape[0], -1).topk(500, dim=1)
             desc_loss_obj = 1 - topk_sim.mean()
             desc_losses.append(desc_loss_obj)
 
         desc_loss = torch.stack(desc_losses).mean()
-        total_loss = pose_loss + self.lambda_desc * desc_loss
+        total_loss = pose_loss_val + self.lambda_desc * desc_loss
 
-        return total_loss, losses_rot.mean(), losses_trans.mean()
+        return total_loss, losses_rot.mean(), losses_trans.mean(), desc_loss

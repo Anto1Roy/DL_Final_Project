@@ -28,6 +28,9 @@ class RenderAndEmbed(nn.Module):
 
         # Resize and normalize for ResNet
         render = F.interpolate(render, size=self.input_size, mode="bilinear", align_corners=False)
+
+        render = render.expand(-1, 3, -1, -1)
+
         render = normalize(render, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         # Pass through CNN

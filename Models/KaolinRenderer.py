@@ -46,6 +46,7 @@ class KaolinRenderer(nn.Module):
         face_vertices_image = verts_ndc[face_b][:, :, :2].unsqueeze(0).float()  # (1, F, 3, 2)
         face_vertices_z = verts_ndc[face_b][:, :, 2].unsqueeze(0).float()       # (1, F, 3)
 
+        # gray scaled RGB
         face_features = torch.ones((1, face_b.shape[0], 3, 1), device=self.device, dtype=torch.float32)
 
         rast_out, _ = rasterize(

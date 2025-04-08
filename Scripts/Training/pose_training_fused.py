@@ -119,7 +119,6 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
     scaler = GradScaler()
 
-    
     early_stopping = EarlyStopping(patience=15, verbose=True, path=model_path)
 
 
@@ -139,6 +138,7 @@ def main():
             losses = []
             trans_loss_avg = 0.0
             rot_loss_avg = 0.0
+            desc_loss_avg = 0.0
             sample_avg = 0
 
             for sample in batch:
@@ -155,7 +155,7 @@ def main():
                 }
 
                 with autocast():
-                    loss, rot_loss, trans_loss = model.compute_pose_loss(
+                    loss, rot_loss, trans_loss, desc_loss = model.compute_pose_loss(
                         x_dict_views=X["views"],
                         R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
                         t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
@@ -166,6 +166,7 @@ def main():
                 losses.append(loss)
                 rot_loss_avg += rot_loss.item()
                 trans_loss_avg += trans_loss.item()
+                desc_loss_avg += desc_loss.item()
                 sample_avg += 1
 
             mean_loss = torch.stack(losses).mean()
@@ -174,7 +175,7 @@ def main():
             scheduler.step(mean_loss)
             scaler.update()
 
-            print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f}")
+            print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f} | Desc: {desc_loss_avg/sample_avg:.4f}")
 
             if index % checkpoint_index == 0:
                 save_checkpoint(model, optimizer, scaler, epoch, index, path=checkpoint_file)
