@@ -15,8 +15,8 @@ from Classes.EarlyStopping import EarlyStopping
 from Models.PoseEstimator.PoseEstimation import PoseEstimator
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="weights/checkpoint_pose_fused.pt"):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="checkpoint_pose_fused.pt"):
+    # os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
         'epoch': epoch,
         'batch_idx': batch_idx,
@@ -27,7 +27,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="weights/ch
     print(f"[INFO] Saved checkpoint to {path}")
 
 
-def load_checkpoint(model, optimizer, scaler, path="weights/checkpoint_pose_fused.pth"):
+def load_checkpoint(model, optimizer, scaler, path="weights/checkpoint_pose_fused.pt"):
     if os.path.exists(path):
         checkpoint = torch.load(path)
         model.load_state_dict(checkpoint["model_state"])
@@ -79,6 +79,7 @@ def main():
     fusion_type = config["training"].get("fusion", "concat")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    patience = config["training"].get("patience", 10)
     checkpoint_index = config["training"].get("checkpoint_index", 50)
     val_every = float(config["training"].get("val_every", 50))
     checkpoint_file = f"checkpoint_{encoder_type}_{fusion_type}.pt"
@@ -119,12 +120,15 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
     scaler = GradScaler()
 
-    early_stopping = EarlyStopping(patience=15, verbose=True, path=model_path)
+    early_stopping = EarlyStopping(patience=patience, verbose=True, path=model_path)
 
 
     start_epoch, _ = load_checkpoint(model, optimizer, scaler, path=checkpoint_file)
 
     for epoch in range(start_epoch, epochs):
+        if early_stopping.early_stop:
+            print("[EARLY STOPPING TRIGGERED] Skipping Epochs.")
+            break
         model.train()
         total_rot_loss, total_trans_loss, total_samples = 0, 0, 0
         index = 0

@@ -28,6 +28,6 @@ class ResNetFeatureEncoder(nn.Module):
         self.out_dim = out_dim
 
     def forward(self, x_dict):
-        x = x_dict[self.modality]  # (B, C, H, W)
+        x = x_dict[self.modality].unsqueeze(0) # (B, C, H, W)
         feat = self.feature_extractor(x)
         return self.out_proj(feat)  # (B, out_dim, H', W')

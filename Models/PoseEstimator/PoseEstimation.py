@@ -25,7 +25,8 @@ class PoseEstimator(nn.Module):
         num_candidates=32,
         noise_level=0.05,
         conf_thresh=0.5,
-        lambda_desc=1.0
+        lambda_desc=10.0,
+        device="cuda"
     ):
         super().__init__()
         self.num_candidates = num_candidates
@@ -34,6 +35,7 @@ class PoseEstimator(nn.Module):
         self.out_dim = 16
         self.fusion_type = fusion_type
         self.lambda_desc = lambda_desc
+        self.device = device
 
         # Feature encoder
         if encoder_type == "resnet":
@@ -58,12 +60,23 @@ class PoseEstimator(nn.Module):
     def extract_single_view_features(self, x_dict):
         return self.encoder(x_dict)
 
-    def detect(self, feat_map, class_embeddings, top_k=15):
+    def detect(self, feat_map, class_embeddings, top_k=100):
         outputs = self.det_head.forward(feat_map)
         detections_batch = self.det_head.match_and_decode(outputs, class_embeddings, top_k=top_k)[0]
         return detections_batch, outputs
 
-    def forward(self, x_dict_views, K_list=None, cad_model_lookup=None, top_k=15):
+    def forward(self, x_dict_views, K_list=None, cad_model_lookup=None, top_k=100):
+        
+        class_embeddings = {
+            obj_id: self.embed_model(
+                item["verts"], item["faces"],
+                R=torch.eye(3, device=self.device),
+                T=torch.zeros(3, device=self.device),
+                K=K_list[0] if K_list is not None else None
+            )
+            for obj_id, item in cad_model_lookup.items()
+        }
+
         feat_maps = [self.extract_single_view_features(x) for x in x_dict_views]
 
         if self.fusion_module:
@@ -71,25 +84,14 @@ class PoseEstimator(nn.Module):
         else:
             fused_map = torch.cat(feat_maps, dim=1)
 
-        detections, outputs = self.detect(fused_map, cad_model_lookup, top_k=top_k)
-        return detections, outputs
+        detections, outputs = self.detect(fused_map, class_embeddings, top_k=top_k)
+        return detections, outputs, class_embeddings
 
     def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, K_list, cad_model_lookup):
         device = K_list[0].device
 
-        # Create class embeddings
-        class_embeddings = {
-            obj_id: self.embed_model(
-                item["verts"], item["faces"],
-                R=torch.eye(3, device=device),
-                T=torch.zeros(3, device=device),
-                K=K_list[0] if K_list is not None else None
-            )
-            for obj_id, item in cad_model_lookup.items()
-        }
-
         # Forward pass with outputs
-        detections_batch, outputs = self.forward(x_dict_views, K_list=K_list, cad_model_lookup=class_embeddings, top_k=15)
+        detections_batch, outputs, class_embeddings = self.forward(x_dict_views, K_list=K_list, cad_model_lookup=cad_model_lookup, top_k=15)
 
         if len(detections_batch) == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -124,7 +126,7 @@ class PoseEstimator(nn.Module):
         for obj_id, obj_embed in class_embeddings.items():
             gt_embedding = obj_embed.view(1, -1, 1, 1)  # [1, D, 1, 1]
             sim_map = F.cosine_similarity(pred_embed, gt_embedding, dim=1)  # [B, H, W]
-            topk_sim, _ = sim_map.view(sim_map.shape[0], -1).topk(500, dim=1)
+            topk_sim, _ = sim_map.view(sim_map.shape[0], -1).topk(100, dim=1)
             desc_loss_obj = 1 - topk_sim.mean()
             desc_losses.append(desc_loss_obj)
 
