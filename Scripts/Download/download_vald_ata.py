@@ -6,8 +6,8 @@ from zipfile import ZipFile
 base_url = "https://huggingface.co/datasets/bop-benchmark/ipd/resolve/main"
 files = [
     "ipd_base.zip",
-    "ipd_models.zip",
-    "ipd_val.zip"
+    # "ipd_models.zip",
+    # "ipd_val.zip"
 ]
 output_dir = "ipd_data"
 extracted_dir = os.path.join(output_dir, "ipd")

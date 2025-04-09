@@ -14,7 +14,7 @@ from Classes.Dataset.StreamingFileManager import StreamingFileManager
 
 class IPDDatasetMounted(Dataset):
     def __init__(self, remote_base_url, cam_ids, modalities=["rgb", "depth"], split="val", transform=None, models_dir=None, allowed_obj_ids=None, allowed_scene_ids=None):
-        self.img_size = (640, 480)
+        self.img_size = (480, 640)
         self.file_manager = StreamingFileManager(remote_base_url)
         self.cam_ids = cam_ids
         self.modalities = modalities
@@ -81,8 +81,9 @@ class IPDDatasetMounted(Dataset):
                     cam_cfg = json.load(open(self.file_manager.get(f"ipd/camera_cam{cam_idx}.json")))
                     fx, fy, cx, cy = cam_cfg["fx"], cam_cfg["fy"], cam_cfg["cx"], cam_cfg["cy"]
                     W_orig, H_orig = cam_cfg["width"], cam_cfg["height"]
-                    W_new, H_new = self.img_size
-                    scale_x, scale_y = W_new / W_orig, H_new / H_orig
+                    H_new, W_new = self.img_size  # <-- Correct unpacking of (H, W)
+                    scale_x = W_new / W_orig
+                    scale_y = H_new / H_orig
 
                     K = torch.tensor([
                         [fx * scale_x, 0, cx * scale_x],
@@ -151,22 +152,27 @@ class IPDDatasetMounted(Dataset):
 
     def read_img(self, remote_path, modality):
         local_path = self.file_manager.get(remote_path)
-
+        print(f"Loading {modality.upper()} image from {local_path}")
         if modality == "rgb":
             img = cv2.imread(local_path)
             if img is None:
                 raise FileNotFoundError(f"RGB image not found at {remote_path}")
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            tensor = self.transform(img[:, :, None])
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # shape: (H, W)
+            print(f"RGB image shape: {img.shape}")
+            img = self.transform(img)  # no [:, :, None] needed!
+            print(f"RGB image shape: {img.shape}")
         else:
             flag = cv2.IMREAD_UNCHANGED if modality == "depth" else 0
             img = cv2.imread(local_path, flag)
             if img is None:
                 raise FileNotFoundError(f"{modality.upper()} image not found at {remote_path}")
             norm = 65535.0 if modality == "depth" else 255.0
-            tensor = self.transform((img.astype(np.float32) / norm)[:, :, None])
-        return tensor
-    
+            img = (img.astype(np.float32) / norm).clip(0, 1)
+            img = self.transform(img)
+
+        # img will now be shape (1, 480, 640)
+        return img
+
     def load_cad_model_points(self, mesh_path, num_points=500):
         mesh = trimesh.load(mesh_path, force='mesh')
 

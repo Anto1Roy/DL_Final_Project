@@ -161,36 +161,41 @@ def main():
             # reproj_loss_avg = 0.0
             sample_avg = 0
 
-            for sample in batch:
-                sample = move_sample_to_device(sample, device)
+            try:
 
-                X, Y = sample["X"], sample["Y"]
-                try:
-                    with autocast():
-                        total_loss, avg_rot, avg_trans, avg_class, avg_conf = model.compute_pose_loss(
-                            x_dict_views=X["views"],
-                            R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
-                            t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
-                            gt_obj_ids=[pose["obj_id"] for pose in Y["gt_poses"]],  
-                            K_list=X["K"],
-                        )
-                except Exception as e:
-                    print(f"[ERROR] {e}")
-                    break
+                for sample in batch:
+                    sample = move_sample_to_device(sample, device)
 
-                losses.append(total_loss)
-                rot_loss_avg += avg_rot.item()
-                trans_loss_avg += avg_trans.item()
-                class_loss_avg += avg_class.item()
-                conf_loss_avg += avg_conf.item()
-                # reproj_loss_avg += avg_reproj.item()
-                sample_avg += 1
+                    X, Y = sample["X"], sample["Y"]
+                    try:
+                        with autocast():
+                            total_loss, avg_rot, avg_trans, avg_class, avg_conf = model.compute_pose_loss(
+                                x_dict_views=X["views"],
+                                R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
+                                t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
+                                gt_obj_ids=[pose["obj_id"] for pose in Y["gt_poses"]],  
+                                K_list=X["K"],
+                            )
+                    except Exception as e:
+                        print(f"[ERROR] {e}")
+                        break
 
-            mean_loss = torch.stack(losses).mean()
-            scaler.scale(mean_loss).backward()
-            scaler.step(optimizer)
-            scheduler.step(mean_loss)
-            scaler.update()
+                    losses.append(total_loss)
+                    rot_loss_avg += avg_rot.item()
+                    trans_loss_avg += avg_trans.item()
+                    class_loss_avg += avg_class.item()
+                    conf_loss_avg += avg_conf.item()
+                    # reproj_loss_avg += avg_reproj.item()
+                    sample_avg += 1
+
+                mean_loss = torch.stack(losses).mean()
+                scaler.scale(mean_loss).backward()
+                scaler.step(optimizer)
+                scheduler.step(mean_loss)
+                scaler.update()
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                continue
 
             print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f}")
             print(f"[INFO] Class Loss: {class_loss_avg/sample_avg:.4f} | Conf Loss: {conf_loss_avg/sample_avg:.4f}") 
@@ -208,7 +213,7 @@ def main():
                 save_checkpoint(model, optimizer, scaler, epoch, index, path=checkpoint_file)
 
             if index % val_every == 0:
-                early_stopping(mean_loss.item(), (trans_loss_avg/sample_avg), (rot_loss_avg/sample_avg) (class_loss_avg/sample_avg), model)
+                early_stopping(mean_loss.item(), (class_loss_avg/sample_avg), (trans_loss_avg/sample_avg), (rot_loss_avg/sample_avg), model)
 
             if early_stopping.early_stop:
                 print("[EARLY STOPPING TRIGGERED] Stopping training early based on training loss.")

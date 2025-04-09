@@ -13,7 +13,7 @@ training:
   device: cuda
   patience: 50
   encoder: resnet #fusenet #resnet
-  fusion: "transformer" #concat
+  fusion: "concat" #concat
   freeze_candidates: false
   freeze_refiner: false
   checkpoint_index: 200

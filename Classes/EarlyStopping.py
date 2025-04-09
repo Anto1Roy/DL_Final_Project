@@ -35,14 +35,7 @@ class EarlyStopping:
         # Check if validation loss is nan
         if np.isnan(val_loss):
             self.trace_func("Validation loss is NaN. Ignoring this epoch.")
-            
-            
-        if val_loss < self.best_val_loss - self.delta or class_loss < self.best_class_loss - self.delta or trans_loss < self.best_trans_loss - self.delta or rot_loss < self.best_rot_loss - self.delta:
-            self.save_checkpoint(val_loss, model)
-            self.counter = 0  # Reset counter since improvement occurred
-        else:
-            self.counter += 1
-            
+        
         if self.best_val_loss is None:
             self.best_val_loss = val_loss
         if self.best_class_loss is None:
@@ -51,7 +44,12 @@ class EarlyStopping:
             self.best_trans_loss = trans_loss
         if self.best_rot_loss is None:
             self.best_rot_loss = rot_loss
-        
+            
+        if val_loss < self.best_val_loss - self.delta or class_loss < self.best_class_loss - self.delta or trans_loss < self.best_trans_loss - self.delta or rot_loss < self.best_rot_loss - self.delta:
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0  # Reset counter since improvement occurred
+        else:
+            self.counter += 1
             
         if val_loss < self.best_val_loss - self.delta:
             self.best_val_loss = val_loss
