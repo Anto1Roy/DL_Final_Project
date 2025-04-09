@@ -105,13 +105,22 @@ class IPDDatasetMounted(Dataset):
         gt_all = json.load(open(self.file_manager.get(f"{base_remote}/scene_gt_{primary_cam}.json")))[fid_key]
 
         gt_poses = []
-        available_cads = []
+        # available_cads = []
+        model_points_by_id = {}
 
         for obj in gt_all:
-            obj_id = obj["obj_id"]
+            obj_id = int(obj["obj_id"])
             R = torch.tensor(obj["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
             t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
             instance_id = obj.get("instance_id", obj_id)  # optional, fallback to obj_id
+
+            model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+
+            if obj_id not in model_points_by_id:
+                model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+                model_points_by_id[obj_id] = self.load_cad_model_points(model_path, num_points=500)
+
+            obj_id = torch.tensor(obj["obj_id"], dtype=torch.float32)
 
             gt_poses.append({
                 "R": R,
@@ -120,20 +129,18 @@ class IPDDatasetMounted(Dataset):
                 "instance_id": instance_id,
             })
 
-            model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-            mesh = trimesh.load(model_path, process=False)
-
-            available_cads.append({
-                "obj_id": obj_id,
-                "verts": torch.tensor(mesh.vertices, dtype=torch.float32),
-                "faces": torch.tensor(mesh.faces, dtype=torch.long),
-            })
+            # available_cads.append({
+            #     "obj_id": obj_id,
+            #     "verts": torch.tensor(mesh.vertices, dtype=torch.float32),
+            #     "faces": torch.tensor(mesh.faces, dtype=torch.long),
+            # })
 
         return {
             "X": {
                 "views": x_dict_views,
                 "K": Ks,
-                "available_cads": available_cads,
+                "model_points_by_id": model_points_by_id
+                # "available_cads": available_cads,
             },
             "Y": {
                 "gt_poses": gt_poses
@@ -158,3 +165,11 @@ class IPDDatasetMounted(Dataset):
             norm = 65535.0 if modality == "depth" else 255.0
             tensor = self.transform((img.astype(np.float32) / norm)[:, :, None])
         return tensor
+    
+    def load_cad_model_points(self, mesh_path, num_points=500):
+        mesh = trimesh.load(mesh_path, force='mesh')
+
+        # Uniformly sample points on the surface
+        points, _ = trimesh.sample.sample_surface(mesh, num_points)
+
+        return torch.tensor(points, dtype=torch.float32)  # (N, 3)

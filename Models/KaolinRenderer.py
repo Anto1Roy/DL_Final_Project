@@ -13,6 +13,7 @@ class KaolinRenderer(nn.Module):
         self.device = device
 
     def forward(self, verts, faces, R, T, K=None):
+        
         # Ensure inputs are batched
         if verts.dim() == 2:
             verts = verts.unsqueeze(0)

@@ -12,7 +12,7 @@ training:
   num_workers: 2
   device: cuda
   patience: 8
-  encoder: resnet #fusenet #resnet
+  encoder: fusenet #resnet
   fusion: "concat"
   freeze_candidates: false
   freeze_refiner: false

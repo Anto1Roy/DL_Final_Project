@@ -10,7 +10,7 @@ sys.path.append(os.getcwd())
 from Models.helpers import *
 
 class FuseDecoder(nn.Module):
-    def __init__(self, ngf=64, act_fn=None):
+    def __init__(self, ngf=64, out_dim=128, act_fn=None):
         super().__init__()
         act_fn = act_fn or nn.ReLU()
         self.deconv = nn.ModuleList([
@@ -26,8 +26,8 @@ class FuseDecoder(nn.Module):
             Conv_residual_conv(ngf, ngf, act_fn),
         ])
         self.refine = nn.Sequential(
-            nn.Conv2d(ngf, ngf, kernel_size=3, padding=1),
-            nn.BatchNorm2d(ngf),
+            nn.Conv2d(ngf, out_dim, kernel_size=3, padding=1),   # make sure it outputs out_dim
+            nn.BatchNorm2d(out_dim),
             nn.ReLU(),
         )
 

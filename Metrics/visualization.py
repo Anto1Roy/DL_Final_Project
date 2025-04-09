@@ -29,3 +29,4 @@ def draw_bbox_from_pose(image, R, t, K, size=(0.1, 0.1, 0.1), label="", color=(2
     img = image.copy()
     cv2.rectangle(img, (x_min, y_min), (x_max, y_max), color, 2)
     return img
+
