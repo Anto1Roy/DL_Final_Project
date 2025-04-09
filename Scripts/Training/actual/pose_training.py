@@ -1,4 +1,5 @@
 # pose_training_fused.py
+import json
 import os
 import sys
 import yaml
@@ -82,8 +83,8 @@ def main():
     patience = config["training"].get("patience", 10)
     checkpoint_index = config["training"].get("checkpoint_index", 50)
     val_every = float(config["training"].get("val_every", 50))
-    checkpoint_file = f"pose_checkpoint_{encoder_type}_{fusion_type}.pt"
-    model_path = f"weights/pose_model_{encoder_type}_{fusion_type}.pt"
+    checkpoint_file = f"pose_checkpoint_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}.pt"
+    model_path = f"weights/pose_model_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}.pt"
 
     train_scene_ids = {f"{i:06d}" for i in range(0, 25)}
     train_obj_ids = {0, 8, 18, 19, 20}
@@ -107,11 +108,11 @@ def main():
 
     sensory_channels = {mod: 1 for mod in modalities}
     model = PoseEstimator(
-        sensory_channels=sensory_channels,
+        sensory_channels,
         encoder_type=encoder_type,
         fusion_type=fusion_type,
+        obj_ids=train_obj_ids,
         n_views=len(cam_ids),
-        num_classes=len(train_obj_ids),
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -121,7 +122,22 @@ def main():
     early_stopping = EarlyStopping(patience=patience, verbose=True, path=model_path)
 
 
-    start_epoch, _ = load_checkpoint(model, optimizer, scaler, path=checkpoint_file)
+    # start_epoch, _ = load_checkpoint(model, optimizer, scaler, path=checkpoint_file)
+
+    start_epoch = 0
+
+    loss_log = {
+        'batch_idx': [],
+        'epoch': [],
+        'loss': [],
+        'trans': [],
+        'rot': [],
+        'class': [],
+        'conf': [],
+    }
+
+    save_path =f"Logs/loss_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}.json"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     for epoch in range(start_epoch, epochs):
         if early_stopping.early_stop:
@@ -149,16 +165,18 @@ def main():
                 sample = move_sample_to_device(sample, device)
 
                 X, Y = sample["X"], sample["Y"]
-
-                with autocast():
-                    total_loss, avg_rot, avg_trans, avg_class, avg_conf  = model.compute_pose_loss(
-                        x_dict_views=X["views"],
-                        R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
-                        t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
-                        gt_obj_ids=[pose["obj_id"] for pose in Y["gt_poses"]],  
-                        model_points_by_id=X["model_points_by_id"],
-                        K_list=X["K"],
-                    )
+                try:
+                    with autocast():
+                        total_loss, avg_rot, avg_trans, avg_class, avg_conf = model.compute_pose_loss(
+                            x_dict_views=X["views"],
+                            R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
+                            t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
+                            gt_obj_ids=[pose["obj_id"] for pose in Y["gt_poses"]],  
+                            K_list=X["K"],
+                        )
+                except Exception as e:
+                    print(f"[ERROR] {e}")
+                    break
 
                 losses.append(total_loss)
                 rot_loss_avg += avg_rot.item()
@@ -175,17 +193,28 @@ def main():
             scaler.update()
 
             print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f}")
-            print(f"[INFO] Class Loss: {class_loss_avg/sample_avg:.4f} | Conf Loss: {conf_loss_avg/sample_avg:.4f}") #| Reproj Loss: {reproj_loss_avg/sample_avg:.4f}")
+            print(f"[INFO] Class Loss: {class_loss_avg/sample_avg:.4f} | Conf Loss: {conf_loss_avg/sample_avg:.4f}") 
+
+
+            loss_log['batch_idx'].append(index)
+            loss_log['epoch'].append(epoch+1)
+            loss_log['loss'].append(total_loss.item())
+            loss_log['trans'].append(avg_trans.item())
+            loss_log['rot'].append(avg_rot.item())
+            loss_log['class'].append(avg_class.item())
+            loss_log['conf'].append(avg_conf.item())
 
             if index % checkpoint_index == 0:
                 save_checkpoint(model, optimizer, scaler, epoch, index, path=checkpoint_file)
 
             if index % val_every == 0:
-                early_stopping(mean_loss.item(), model)
+                early_stopping(mean_loss.item(), (trans_loss_avg/sample_avg), (rot_loss_avg/sample_avg) (class_loss_avg/sample_avg), model)
 
             if early_stopping.early_stop:
                 print("[EARLY STOPPING TRIGGERED] Stopping training early based on training loss.")
                 break
+        with open(save_path, "w") as f:
+            json.dump(loss_log, f, indent=4)
 
         total_rot_loss += rot_loss_avg
         total_trans_loss += trans_loss_avg

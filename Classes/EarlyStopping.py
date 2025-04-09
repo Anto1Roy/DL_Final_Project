@@ -22,32 +22,48 @@ class EarlyStopping:
         self.verbose = verbose
         self.counter = 0
         self.best_val_loss = None
+        self.best_class_loss = None
+        self.best_trans_loss = None
+        self.best_rot_loss = None
         self.early_stop = False
         self.val_loss_min = np.inf
         self.delta = delta
         self.path = path
         self.trace_func = trace_func
 
-    def __call__(self, val_loss, model):
+    def __call__(self, val_loss, class_loss, trans_loss, rot_loss, model):
         # Check if validation loss is nan
         if np.isnan(val_loss):
             self.trace_func("Validation loss is NaN. Ignoring this epoch.")
-            return
-
-        if self.best_val_loss is None:
-            self.best_val_loss = val_loss
-            self.save_checkpoint(val_loss, model)
-        elif val_loss < self.best_val_loss - self.delta:
-            # Significant improvement detected
-            self.best_val_loss = val_loss
+            
+            
+        if val_loss < self.best_val_loss - self.delta or class_loss < self.best_class_loss - self.delta or trans_loss < self.best_trans_loss - self.delta or rot_loss < self.best_rot_loss - self.delta:
             self.save_checkpoint(val_loss, model)
             self.counter = 0  # Reset counter since improvement occurred
         else:
-            # No significant improvement
             self.counter += 1
-            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
+            
+        if self.best_val_loss is None:
+            self.best_val_loss = val_loss
+        if self.best_class_loss is None:
+            self.best_class_loss = class_loss
+        if self.best_trans_loss is None:
+            self.best_trans_loss = trans_loss
+        if self.best_rot_loss is None:
+            self.best_rot_loss = rot_loss
+        
+            
+        if val_loss < self.best_val_loss - self.delta:
+            self.best_val_loss = val_loss
+        if class_loss < self.best_class_loss - self.delta:
+            self.best_class_loss = class_loss
+        if trans_loss < self.best_trans_loss - self.delta:
+            self.best_trans_loss = trans_loss
+        if rot_loss < self.best_rot_loss - self.delta:
+            self.best_rot_loss = rot_loss
+
+        if self.counter >= self.patience:
+            self.early_stop = True
 
     def save_checkpoint(self, val_loss, model):
         '''Saves model when validation loss decreases.'''

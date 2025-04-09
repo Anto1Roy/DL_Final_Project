@@ -21,8 +21,7 @@ class ResNetFeatureEncoder(nn.Module):
             base_model.layer3,
         )
 
-        in_channels = base_model.layer3[-1].conv3.out_channels
-        self.out_proj = nn.Conv2d(in_channels, out_dim, kernel_size=1)
+        self.out_proj = nn.Conv2d(256, out_dim, kernel_size=1)
         self.out_dim = out_dim
 
     def forward(self, x_dict):

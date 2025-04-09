@@ -1,7 +1,7 @@
 dataset:
   remote_base_url: ipd_data/ipd
-  cam_ids: [cam1, cam2, cam3]
-  modality: [rgb, depth] #, aolp, dolp]
+  cam_ids: [cam1] #, cam2, cam3]
+  modality: [rgb] #, depth, aolp, dolp]
   train_split: train_pbr
   val_split: val
   model_split: models
@@ -11,9 +11,9 @@ training:
   epochs: 1
   num_workers: 2
   device: cuda
-  patience: 8
-  encoder: fusenet #resnet
-  fusion: "concat"
+  patience: 50
+  encoder: resnet #fusenet #resnet
+  fusion: "transformer" #concat
   freeze_candidates: false
   freeze_refiner: false
   checkpoint_index: 200

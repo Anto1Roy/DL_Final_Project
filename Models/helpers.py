@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 
 
@@ -34,6 +35,46 @@ def conv_block_3(in_dim,out_dim,act_fn):
         nn.BatchNorm2d(out_dim),
     )
     return model
+
+def quaternion_to_matrix_no_B(q):
+    """
+    Converts a batch of quaternions to rotation matrices.
+    Args:
+        q: (N, 4) quaternion in (x, y, z, w) format
+    Returns:
+        R: (N, 3, 3) rotation matrices
+    """
+    q = F.normalize(q, dim=-1)  # Ensure unit quaternion
+
+    qx, qy, qz, qw = q.unbind(-1)
+
+    # Precompute terms
+    xx = qx * qx
+    yy = qy * qy
+    zz = qz * qz
+    ww = qw * qw
+    xy = qx * qy
+    xz = qx * qz
+    yz = qy * qz
+    xw = qx * qw
+    yw = qy * qw
+    zw = qz * qw
+
+    R = torch.empty(q.shape[0], 3, 3, device=q.device, dtype=q.dtype)
+
+    R[:, 0, 0] = 1 - 2 * (yy + zz)
+    R[:, 0, 1] = 2 * (xy - zw)
+    R[:, 0, 2] = 2 * (xz + yw)
+
+    R[:, 1, 0] = 2 * (xy + zw)
+    R[:, 1, 1] = 1 - 2 * (xx + zz)
+    R[:, 1, 2] = 2 * (yz - xw)
+
+    R[:, 2, 0] = 2 * (xz - yw)
+    R[:, 2, 1] = 2 * (yz + xw)
+    R[:, 2, 2] = 1 - 2 * (xx + yy)
+
+    return R
 
 def quaternion_to_matrix(q):
     B = q.shape[0]
