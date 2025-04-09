@@ -7,7 +7,7 @@ from scipy.optimize import linear_sum_assignment
 
 from Models.CosyPose.CandidatePose import CandidatePoseModel
 from Models.ObjectDetection.FuseNet.FuseNet import FuseNetFeatureEncoder
-from Models.ObjectDetection.ResNet import ResNetFeatureEncoder
+from Models.Encoding.ResNet import ResNetFeatureEncoder
 from Models.PoseEstimator.TransformerFusion import TransformerFusion
 from Models.PoseEstimator.RenderAndEmbed import RenderAndEmbed
 from Models.helpers import quaternion_to_matrix

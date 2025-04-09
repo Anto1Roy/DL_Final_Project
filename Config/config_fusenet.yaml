@@ -20,7 +20,7 @@ training:
   val_every: 10
 
 optim:
-  lr: 1e-5
+  lr: 1e-4
   weight_decay: 0.0
 
 renderer:

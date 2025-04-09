@@ -6,7 +6,7 @@ from Models.ObjectDetection.GridObjectDetector import GridObjectDetector
 from Models.Encoding.FuseNet.FuseNet import FuseNetFeatureEncoder
 from Models.Encoding.ResNet import ResNetFeatureEncoder
 from Models.PoseEstimatorSeen.TransformerFusion import TransformerFusion
-from Models.helpers import quaternion_to_matrix
+from Models.helpers import hungarian_matching, quaternion_to_matrix
 from scipy.optimize import linear_sum_assignment
 
 
@@ -48,9 +48,10 @@ class PoseEstimator(nn.Module):
         else:
             fused_feat = torch.cat(feats, dim=1)
 
-        outputs = self.det_head(fused_feat)
+        raw_outputs = self.det_head(fused_feat)
+        outputs = self.det_head.apply_activations(raw_outputs)
         detections = self.det_head.decode_poses(outputs, top_k=top_k)
-        return detections, outputs
+        return detections, raw_outputs
 
     def project(self, R_, t_, model_points, K):
         X_cam = R_ @ model_points.T + t_.view(3, 1)
@@ -63,88 +64,85 @@ class PoseEstimator(nn.Module):
         return F.mse_loss(x_proj_pred, x_proj_gt)
 
     def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, gt_obj_ids, K_list, model_points_by_id=None, top_k=100):
-        detections, outputs = self.forward(x_dict_views, K_list=K_list, top_k=top_k)
-        quat, trans, conf, class_scores = outputs['quat'], outputs['trans'], outputs['conf'], outputs['class_scores']
-        B, H, W, A, _ = quat.shape
+        activations, raw_out = self.forward(x_dict_views, K_list=K_list, top_k=top_k)
+        outputs = self.det_head.apply_activations(raw_out)
+
+        quat = outputs['quat'][0].reshape(-1, 4)
+        trans = outputs['trans'][0].reshape(-1, 3)
+        conf = outputs['conf'][0].reshape(-1)
+        class_scores = outputs['class_scores'][0].reshape(-1, outputs['class_scores'].shape[-1])
+        pred_classes = class_scores.argmax(dim=-1)
+        pred_Rs = quaternion_to_matrix(quat)
+
         device = quat.device
-        num_classes = class_scores.shape[-1]
+        matched_pred_idx = set()
+        total_rot_loss = 0.0
+        total_trans_loss = 0.0
+        total_class_loss = 0.0
+        total_conf_loss = 0.0
+        total_matches = 0
 
-        total_rot_loss, total_trans_loss, total_conf_loss, total_class_loss = 0, 0, 0, 0
-        matched_gt = 0
+        # Group GTs by object ID
+        gt_by_class = {}
+        for i, obj_id in enumerate(gt_obj_ids):
+            gt_by_class.setdefault(int(obj_id.item()), []).append((R_gt_list[i].to(device), t_gt_list[i].to(device)))
 
-        # Flatten predictions
-        pred_quats = quat.view(B, -1, 4)           # (B, N, 4)
-        pred_trans = trans.view(B, -1, 3)          # (B, N, 3)
-        pred_conf  = conf.view(B, -1)              # (B, N)
-        class_scores = class_scores.view(B, -1, num_classes)  # (B, N, C)
-        pred_classes = class_scores.argmax(dim=-1)             # (B, N)
+        for obj_id, gt_poses in gt_by_class.items():
+            gt_Rs = torch.stack([R for R, _ in gt_poses])
+            gt_ts = torch.stack([t for _, t in gt_poses])
 
-        # Only batch size 1 for now
-        assert B == 1
-        pred_quats = pred_quats[0]
-        pred_trans = pred_trans[0]
-        pred_conf  = pred_conf[0]
-        pred_classes = pred_classes[0]
-        class_scores = class_scores[0]
-
-        # Organize GT
-        sample_gt = [(int(obj_id.item()), R_gt_list[i], t_gt_list[i]) for i, obj_id in enumerate(gt_obj_ids[0])]
-        gt_by_obj = {}
-        for obj_id, R, t in sample_gt:
-            gt_by_obj.setdefault(obj_id, []).append((R.to(device), t.to(device)))
-
-        for obj_id, gt_instances in gt_by_obj.items():
-            gt_Rs = torch.stack([R for R, _ in gt_instances])
-            gt_ts = torch.stack([t for _, t in gt_instances])
-
-            # Filter predictions for this class
-            mask = (pred_classes == obj_id)
-            if not mask.any():
-                total_conf_loss += len(gt_Rs)  # all GT missed
+            mask = pred_classes == obj_id
+            if mask.sum() == 0:
                 continue
 
-            pred_q_obj = pred_quats[mask]
-            pred_t_obj = pred_trans[mask]
-            pred_c_obj = pred_conf[mask]
-            class_logit_obj = class_scores[mask]
+            pred_R_obj = pred_Rs[mask]
+            pred_t_obj = trans[mask]
+            pred_conf_obj = conf[mask]
+            pred_class_logits = class_scores[mask]
+            pred_indices = mask.nonzero(as_tuple=True)[0]
 
-            # Convert quats to matrices
-            pred_Rs = quaternion_to_matrix(pred_q_obj)
-
-            # Match each GT to closest pred
-            rot_diff = torch.cdist(gt_Rs.reshape(len(gt_Rs), -1), pred_Rs.reshape(len(pred_Rs), -1))
+            rot_diff = torch.cdist(gt_Rs.view(len(gt_Rs), -1), pred_R_obj.view(len(pred_R_obj), -1))
             trans_diff = torch.cdist(gt_ts, pred_t_obj)
-            total_diff = rot_diff + trans_diff
-            min_costs, indices = total_diff.min(dim=1)  # match GT→pred
+            cost_matrix = rot_diff + trans_diff  # [N_gt, N_pred]
 
-            matched_gt += len(gt_Rs)
+            from scipy.optimize import linear_sum_assignment
+            row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
 
-            for i, j in enumerate(indices):
-                R_gt, t_gt = gt_Rs[i], gt_ts[i]
-                R_pred, t_pred = pred_Rs[j], pred_t_obj[j]
-                q_pred = pred_q_obj[j]
+            for i, j in zip(row_ind, col_ind):
+                R_gt, t_gt = gt_poses[i]
+                R_pred, t_pred = pred_R_obj[j], pred_t_obj[j]
 
-                R_pred = quaternion_to_matrix(pred_quats[j].unsqueeze(0))[0]
                 total_rot_loss += F.mse_loss(R_pred, R_gt)
                 total_trans_loss += F.mse_loss(t_pred, t_gt)
+                total_class_loss += F.cross_entropy(
+                    pred_class_logits[j].unsqueeze(0), torch.tensor([obj_id], device=device)
+                )
+                target_conf = class_scores[pred_indices[j], obj_id]  # model's class probability for matched obj
+                total_conf_loss += F.binary_cross_entropy_with_logits(
+                    pred_conf_obj[j].unsqueeze(0), target_conf.unsqueeze(0)
+                )
+                matched_pred_idx.add(pred_indices[j].item())
+                total_matches += 1
 
-                total_conf_loss += F.binary_cross_entropy(pred_c_obj[j].unsqueeze(0), torch.tensor([1.0], device=device))
-                total_class_loss += F.cross_entropy(class_logit_obj[j].unsqueeze(0), torch.tensor([obj_id], device=device))
+        # ✅ Penalize unmatched predictions with conf = 0
+        unmatched_mask = torch.ones(len(conf), dtype=torch.bool, device=device)
+        if matched_pred_idx:
+            unmatched_mask[list(matched_pred_idx)] = False
+        if unmatched_mask.any():
+            total_conf_loss += F.binary_cross_entropy_with_logits(
+                conf[unmatched_mask], torch.zeros_like(conf[unmatched_mask])
+            )
 
-        # Penalize unmatched predictions as false positives
-        unmatched = torch.ones(pred_conf.shape[0], device=device, dtype=torch.bool)
-        for obj_id in gt_by_obj:
-            unmatched &= (pred_classes != obj_id)
-        total_conf_loss += F.binary_cross_entropy(pred_conf[unmatched], torch.zeros_like(pred_conf[unmatched]))
-
-        if matched_gt == 0:
+        if total_matches == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero, zero, zero
+            return zero, zero, zero, zero, zero
 
-        avg_rot = total_rot_loss / matched_gt
-        avg_trans = total_trans_loss / matched_gt
-        avg_class = total_class_loss / matched_gt
-        avg_conf = total_conf_loss / (matched_gt + unmatched.sum())
-
+        avg_rot = total_rot_loss / total_matches
+        avg_trans = total_trans_loss / total_matches
+        avg_class = total_class_loss / total_matches
+        avg_conf = total_conf_loss / len(conf)
         total_loss = avg_rot + avg_trans + avg_class + avg_conf
+
         return total_loss, avg_rot, avg_trans, avg_class, avg_conf
+
+

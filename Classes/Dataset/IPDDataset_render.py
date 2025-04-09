@@ -67,7 +67,8 @@ class IPDDatasetMounted(Dataset):
             view_valid = True
 
             for modality in self.modalities:
-                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.{'jpg' if modality == 'rgb' else 'png'}"
+                ext = 'png' if modality != 'rgb' else ('png' if self.split == "val" else 'jpg')
+                remote_path = f"{base_remote}/{modality}_{cam_id}/{fid}.{ext}"
                 try:
                     view_dict[modality] = self.read_img(remote_path, modality)
                 except Exception:

@@ -106,3 +106,13 @@ def compute_add_s(pred_R, pred_t, gt_R, gt_t, model_points, sym_permutations=Non
     if reduction == 'mean':
         return add_s.mean()
     return add_s
+
+def hungarian_matching(cost_matrix):
+    # Input: cost_matrix [N_gt, N_pred] (torch.Tensor, on GPU)
+    import numpy as np
+    import torch
+
+    cost = cost_matrix.detach().cpu().numpy()
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(cost)
+    return torch.tensor(row_ind, dtype=torch.long), torch.tensor(col_ind, dtype=torch.long)
