@@ -60,10 +60,15 @@ class PoseEstimator(nn.Module):
     def extract_single_view_features(self, x_dict):
         return self.encoder(x_dict)
 
-    def detect(self, feat_map, class_embeddings, top_k=100):
+    def detect(self, feat_map, class_embeddings, top_k=100, score_thresh=0.5):
         outputs = self.det_head.forward(feat_map)
+        # Get the detections for the first sample in the batch.
         detections_batch = self.det_head.match_and_decode(outputs, class_embeddings, top_k=top_k)[0]
-        return detections_batch, outputs
+        
+        # Filter out detections with a score below the threshold.
+        detections_batch_filtered = [det for det in detections_batch if det['score'] >= score_thresh]
+        
+        return detections_batch_filtered, outputs
 
     def forward(self, x_dict_views, K_list=None, cad_model_lookup=None, top_k=100):
         

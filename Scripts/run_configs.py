@@ -8,7 +8,8 @@ def run_training(config_path):
         sys.executable,
         # "Scripts/Training/E2E_training.py",
         # "Scripts/Training/pose_training_fused.py",
-         "Scripts/Testing/pose_testing_fused.py",
+        # "Scripts/Testing/pose_testing_unseen.py",
+         "Scripts/Testing/pose_testing_seen.py",
         config_path
     ])
 

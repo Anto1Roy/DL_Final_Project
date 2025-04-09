@@ -5,3 +5,6 @@
 *.pth
 *.pt
 *.json
+*.png
+*.jpg
+*.jpeg
