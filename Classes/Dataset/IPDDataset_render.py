@@ -61,6 +61,7 @@ class IPDDatasetMounted(Dataset):
         x_dict_views = []
         Ks = []
         valid_views = []
+        cam_poses = []
 
         for cam_id in self.cam_ids:
             view_dict = {}
@@ -99,7 +100,30 @@ class IPDDatasetMounted(Dataset):
 
         if len(x_dict_views) != len(self.cam_ids):
             return None
+        
+        scene_cam_extrinsics = []
+        bbox_info_all = []
 
+        for cam_id in valid_views:
+            cam_idx = int(cam_id.replace("cam", ""))
+            # === Load extrinsics ===
+            scene_cam_path = self.file_manager.get(f"{base_remote}/scene_camera_cam{cam_idx}.json")
+            scene_cam_data = json.load(open(scene_cam_path))[frame_id]
+
+            R_w2c = torch.tensor(scene_cam_data["cam_R_w2c"], dtype=torch.float32).reshape(3, 3)
+            t_w2c = torch.tensor(scene_cam_data["cam_t_w2c"], dtype=torch.float32).reshape(3) / 1000.0  # mm → m
+
+            scene_cam_extrinsics.append({
+                "R_w2c": R_w2c,
+                "t_w2c": t_w2c
+            })
+
+            # === Load GT bounding boxes ===
+            gt_info_path = self.file_manager.get(f"{base_remote}/scene_gt_info_cam{cam_idx}.json")
+            bbox_data = json.load(open(gt_info_path))[frame_id]
+            bbox_info_all.append(bbox_data)
+
+        # === Intrinsics ===
         Ks = torch.stack(Ks)
 
         # === Ground truth ===
@@ -107,8 +131,7 @@ class IPDDatasetMounted(Dataset):
         gt_all = json.load(open(self.file_manager.get(f"{base_remote}/scene_gt_{primary_cam}.json")))[fid_key]
 
         gt_poses = []
-        # available_cads = []
-        model_points_by_id = {}
+        # model_points_by_id = {}
 
         for obj in gt_all:
             obj_id = int(obj["obj_id"])
@@ -116,11 +139,12 @@ class IPDDatasetMounted(Dataset):
             t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
             instance_id = obj.get("instance_id", obj_id)  # optional, fallback to obj_id
 
-            model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+            # model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
 
-            if obj_id not in model_points_by_id:
-                model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-                model_points_by_id[obj_id] = self.load_cad_model_points(model_path, num_points=500)
+            # load CAD model
+            # if obj_id not in model_points_by_id:
+            #     model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+            #     model_points_by_id[obj_id] = self.load_cad_model_points(model_path, num_points=500)
 
             obj_id = torch.tensor(obj["obj_id"], dtype=torch.float32)
 
@@ -141,13 +165,15 @@ class IPDDatasetMounted(Dataset):
             "X": {
                 "views": x_dict_views,
                 "K": Ks,
-                "model_points_by_id": model_points_by_id
-                # "available_cads": available_cads,
+                # "model_points_by_id": model_points_by_id,
+                "extrinsics": scene_cam_extrinsics,
+                "bbox_info": bbox_info_all,
             },
             "Y": {
                 "gt_poses": gt_poses
             }
         }
+
 
 
     def read_img(self, remote_path, modality):

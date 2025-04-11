@@ -43,11 +43,11 @@ class PoseEstimator(nn.Module):
             self.fusion_module = None
             self.det_head = GridObjectDetector(in_dim=(self.out_dim * n_views), num_classes=len(obj_ids), anchors=anchors)
 
-    def forward(self, x_dict_views, K_list, top_k=100):
+    def forward(self, x_dict_views, K_list, extrinsics, top_k=100):
         feats = [self.encoder(x) for x in x_dict_views]
 
         if self.fusion_module:
-            fused_feat = self.fusion_module(feats, K_list)
+            fused_feat = self.fusion_module(feats, K_list, extrinsics=extrinsics)
         else:
             fused_feat = torch.cat(feats, dim=1)
 
@@ -56,8 +56,8 @@ class PoseEstimator(nn.Module):
         detections = self.det_head.decode_poses(outputs, top_k=top_k)
         return detections, raw_outputs
 
-    def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, gt_obj_ids, K_list, top_k=100):
-        activations, raw_out = self.forward(x_dict_views, K_list=K_list, top_k=top_k)
+    def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, gt_obj_ids, K_list, extrinsics, bbox_gt_list=None, top_k=100):
+        activations, raw_out = self.forward(x_dict_views, K_list=K_list, extrinsics=extrinsics, top_k=top_k)
         outputs = self.det_head.apply_activations(raw_out)
 
         quat = outputs['quat'][0].reshape(-1, 4)
@@ -75,10 +75,31 @@ class PoseEstimator(nn.Module):
         total_conf_loss = 0.0
         total_matches = 0
 
+        # Auxiliary bounding box loss
+        if bbox_gt_list is not None:
+            for view_idx, bbox_view in enumerate(bbox_gt_list):
+                K = K_list[view_idx]
+                for j in range(len(quat)):
+                    R_pred = quaternion_to_matrix(quat[j].unsqueeze(0))[0]
+                    t_pred = trans[j]
+                    # Dummy projection point for now
+                    # proj_2d = self.project(R_pred, t_pred, torch.tensor([[0., 0., 0.]], device=device), K)
+                    # x, y = proj_2d[0]
+                    pred_box = torch.tensor([x, y, 1.0, 1.0], device=device)  # dummy box
+                    if j < len(bbox_view.get("bbox_visib_list", [])):
+                        gt_box = torch.tensor(bbox_view["bbox_visib_list"][j], dtype=torch.float32, device=device)
+                        total_bbox_loss += F.l1_loss(pred_box, gt_box)
+
         # Group GTs by object ID
         gt_by_class = {}
-        for i, obj_id in enumerate(gt_obj_ids):
-            gt_by_class.setdefault(int(obj_id.item()), []).append((R_gt_list[i].to(device), t_gt_list[i].to(device)))
+        for view_idx in range(len(R_gt_list)):
+            for i, obj_id in enumerate(gt_obj_ids[view_idx]):
+                key = int(obj_id.item())
+                R_cam = extrinsics[view_idx]["R_w2c"]
+                t_cam = extrinsics[view_idx]["t_w2c"]
+                R_gt_global = R_cam.T @ R_gt_list[view_idx][i].to(device)
+                t_gt_global = R_cam.T @ (t_gt_list[view_idx][i].to(device) - t_cam)
+                gt_by_class.setdefault(key, []).append((R_gt_global, t_gt_global))
 
         for obj_id, gt_poses in gt_by_class.items():
             gt_Rs = torch.stack([R for R, _ in gt_poses])
