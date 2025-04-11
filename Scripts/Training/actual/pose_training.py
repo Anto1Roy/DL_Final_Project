@@ -58,10 +58,15 @@ def move_sample_to_device(sample, device):
         pose["t"] = pose["t"].to(device)
         pose["obj_id"] = pose["obj_id"].to(device)
 
-    for obj_id in X["model_points_by_id"]:
-        X["model_points_by_id"][obj_id] = X["model_points_by_id"][obj_id].to(device)
+    # for obj_id in X["model_points_by_id"]:
+    #     X["model_points_by_id"][obj_id] = X["model_points_by_id"][obj_id].to(device)
+
+    for extr in X.get("extrinsics", []):
+        extr["R_w2c"] = extr["R_w2c"].to(device)
+        extr["t_w2c"] = extr["t_w2c"].to(device)
 
     return sample
+
 
 
 def main():
@@ -171,11 +176,15 @@ def main():
                         with autocast():
                             total_loss, avg_rot, avg_trans, avg_class, avg_conf = model.compute_pose_loss(
                                 x_dict_views=X["views"],
-                                R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
-                                t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
-                                gt_obj_ids=[pose["obj_id"] for pose in Y["gt_poses"]],  
+                                R_gt_list=[[pose["R"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                t_gt_list=[[pose["t"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                gt_obj_ids=[[pose["obj_id"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
                                 K_list=X["K"],
+                                extrinsics=Y["extrinsics"],
                             )
+                            # if needed
+                            # bboxes=Y["bbox_visib"],
+
                     except Exception as e:
                         print(f"[ERROR] {e}")
                         break

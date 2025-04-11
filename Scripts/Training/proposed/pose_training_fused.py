@@ -52,15 +52,20 @@ def move_sample_to_device(sample, device):
 
     X["K"] = X["K"].to(device)
 
-    for item in X["available_cads"]:
-        item["verts"] = item["verts"].to(device)
-        item["faces"] = item["faces"].to(device)
-
     for pose in Y["gt_poses"]:
         pose["R"] = pose["R"].to(device)
         pose["t"] = pose["t"].to(device)
+        pose["obj_id"] = pose["obj_id"].to(device)
+
+    # for obj_id in X["model_points_by_id"]:
+    #     X["model_points_by_id"][obj_id] = X["model_points_by_id"][obj_id].to(device)
+
+    for extr in X.get("extrinsics", []):
+        extr["R_w2c"] = extr["R_w2c"].to(device)
+        extr["t_w2c"] = extr["t_w2c"].to(device)
 
     return sample
+
 
 
 def main():
