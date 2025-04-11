@@ -6,9 +6,8 @@ from Models.helpers import *
 from Models.KaolinRenderer import KaolinRenderer
 
 class CosyPoseStyleRenderMatch(nn.Module):
-    def __init__(self, renderer_config, num_candidates=32, use_learned_similarity=True):
+    def __init__(self, renderer_config, use_learned_similarity=True):
         super().__init__()
-        self.num_candidates = num_candidates
         self.use_learned_similarity = use_learned_similarity
         self.render_weight = renderer_config.get("render_weight", 1.0)
 

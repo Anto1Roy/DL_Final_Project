@@ -4,10 +4,10 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from Models.CosyPose.CandidatePose import CandidatePoseModel
-from Models.ObjectDetection.FuseNet.FuseNet import FuseNetFeatureEncoder
+from Models.Encoding.FuseNet.FuseNet import FuseNetFeatureEncoder
 from Models.Encoding.ResNet34 import ResNetFeatureEncoder
-from Models.PoseEstimator.TransformerFusion import TransformerFusion
-from Models.PoseEstimator.RenderAndEmbed import RenderAndEmbed
+from Models.ProposedPoseEstimator.TransformerFusion import TransformerFusion
+from Models.ProposedPoseEstimator.RenderAndEmbed import RenderAndEmbed
 from Models.helpers import quaternion_to_matrix
 from Models.KaolinRenderer import KaolinRenderer  
 
@@ -90,26 +90,6 @@ class PoseEstimator(nn.Module):
         return detections, outputs, class_embeddings
 
     def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, K_list, cad_model_lookup, extrinsics, bbox_gt_list):
-        """
-        Computes the pose loss by comparing predicted candidate poses (transformed into global coordinates)
-        to the ground-truth poses (also transformed into global coordinates). Additionally, a multi-object 
-        descriptor loss is computed.
-        
-        For each view, both the predicted translation and the GT translation are adjusted using the 
-        corresponding camera intrinsics (here, via simple normalization by focal lengths) and then transformed 
-        to global coordinates using the extrinsics.
-        
-        Args:
-            x_dict_views: List of view dictionaries {modality -> Tensor(C, H, W)}.
-            R_gt_list: Nested list over views; per view, a list of GT rotation matrices (in camera coordinates).
-            t_gt_list: Nested list over views; per view, a list of GT translation vectors (in camera coordinates).
-            K_list: List (or Tensor) of camera intrinsics (one per view; each a tensor of shape (3,3)).
-            cad_model_lookup: Dictionary mapping object IDs to CAD model data.
-            extrinsics: List of dictionaries (one per view), each with keys "R_w2c" (Tensor(3,3)) and "t_w2c" (Tensor(3)).
-        
-        Returns:
-            total_loss, avg_rot, avg_trans, desc_loss
-        """
         device = K_list[0].device
 
         total_rot_loss = 0.0
@@ -126,26 +106,26 @@ class PoseEstimator(nn.Module):
             # --- Extract features and detections for current view ---
             feat = self.extract_single_view_features(x_dict_views[view_idx])
             outputs = self.det_head.forward(feat, K=K_list[view_idx], extrinsics=extrinsics[view_idx])
-            outputs = self.det_head.apply_activations(outputs)
+            # outputs = self.det_head.apply_activations(outputs)
             # Auxiliary bounding-box prediction.
-            bbox_pred = self.det_head.bbox_head(feat)  # [1, 4, H, W] (if available from the candidate model)
-            _, _, H, W = bbox_pred.shape
+            # bbox_pred = self.det_head.bbox_head(feat)  # [1, 4, H, W] (if available from the candidate model)
+            # _, _, H, W = bbox_pred.shape
 
-            view_bbox_loss = 0.0
-            # Assume bbox_gt_list[view_idx] is a dict with key "bbox_visib_list"
-            if (bbox_gt_list is not None) and (view_idx < len(bbox_gt_list)):
-                bbox_gt_view = bbox_gt_list[view_idx]
-                pred_bbox_map = bbox_pred[0].permute(1, 2, 0)  # [H, W, 4]
-                center_h = H // 2
-                center_w = W // 2
-                pred_box = pred_bbox_map[center_h, center_w]
-                if "bbox_visib_list" in bbox_gt_view and len(bbox_gt_view["bbox_visib_list"]) > 0:
-                    gt_box = torch.tensor(bbox_gt_view["bbox_visib_list"][0], dtype=torch.float32, device=device)
-                    view_bbox_loss += F.l1_loss(pred_box, gt_box)
-            total_bbox_loss += view_bbox_loss
+            # view_bbox_loss = 0.0
+            # # Assume bbox_gt_list[view_idx] is a dict with key "bbox_visib_list"
+            # if (bbox_gt_list is not None) and (view_idx < len(bbox_gt_list)):
+            #     bbox_gt_view = bbox_gt_list[view_idx]
+            #     pred_bbox_map = bbox_pred[0].permute(1, 2, 0)  # [H, W, 4]
+            #     center_h = H // 2
+            #     center_w = W // 2
+            #     pred_box = pred_bbox_map[center_h, center_w]
+            #     if "bbox_visib_list" in bbox_gt_view and len(bbox_gt_view["bbox_visib_list"]) > 0:
+            #         gt_box = torch.tensor(bbox_gt_view["bbox_visib_list"][0], dtype=torch.float32, device=device)
+            #         view_bbox_loss += F.l1_loss(pred_box, gt_box)
+            # total_bbox_loss += view_bbox_loss
 
             # --- Process pose predictions for current view ---
-            # Assume batch size is 1.
+            # Assume batch size is 1
             quat = outputs['quat'][0].reshape(-1, 4)
             trans = outputs['trans'][0].reshape(-1, 3)
             conf = outputs['conf'][0].reshape(-1)
@@ -157,12 +137,12 @@ class PoseEstimator(nn.Module):
             R_w2c = extrinsics[view_idx]["R_w2c"].to(device)
             t_w2c = extrinsics[view_idx]["t_w2c"].to(device)
             K = K_list[view_idx].to(device)
-            # Compute a simple normalization factor from the intrinsics (using fx and fy).
+            # Compute a simple normalization factor from the intrinsics (using fx and fy)
             fx = K[0, 0]
             fy = K[1, 1]
             scale = torch.tensor([1.0/fx, 1.0/fy, 1.0], device=device)
 
-            # Transform GT poses for current view into global coordinates.
+            # Transform GT poses for current view into global coordinates
             view_gt_Rs = []
             view_gt_ts = []
             for i, obj_id in enumerate(R_gt_list[view_idx]):
@@ -214,15 +194,26 @@ class PoseEstimator(nn.Module):
 
         if total_matches == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero
 
         avg_rot = total_rot_loss / total_matches
         avg_trans = total_trans_loss / total_matches
         avg_class = total_class_loss / total_matches
         avg_conf = total_conf_loss / (total_matches + 1e-6)
-        avg_bbox = total_bbox_loss / num_views
+        # avg_bbox = total_bbox_loss / num_views
 
-        total_loss = avg_rot + avg_trans + avg_class + avg_conf + 0.1 * avg_bbox
+        total_loss = avg_rot + avg_trans + avg_class + avg_conf
+
+        class_embeddings = {}
+
+        # Compute class embeddings for each CAD object.
+        for obj_id, item in cad_model_lookup.items():
+            verts = item["verts"]
+            faces = item["faces"]
+            R = torch.eye(3, device=device)
+            T = torch.zeros(3, device=device)
+            K = K_list[0] if K_list is not None else None
+            class_embeddings[obj_id] = self.embed_model(verts, faces, R=R, T=T, K=K)
 
         # Additionally compute the multi-object descriptor loss.
         pred_embed = outputs["embed"]  # [B, D, H, W]
@@ -239,4 +230,4 @@ class PoseEstimator(nn.Module):
             desc_loss = torch.tensor(0.0, device=device)
         total_loss = total_loss + self.lambda_desc * desc_loss
 
-        return total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_bbox
+        return total_loss, avg_rot, avg_trans, avg_class, avg_conf

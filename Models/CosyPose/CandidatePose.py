@@ -16,7 +16,7 @@ class CandidatePoseModel(nn.Module):
         These are passed to the detection head so that it can output predictions in both the original 
         (camera) coordinate system and the transformed (global) coordinates.
         """
-        quat, trans, embed, confidence, bbox, global_R, global_trans = self.det_head(
+        quat, trans, embed, confidence, global_R, global_trans = self.det_head(
             feat_map, K=K, extrinsics=extrinsics
         )
         return {
@@ -24,7 +24,6 @@ class CandidatePoseModel(nn.Module):
             "trans": trans,         # (B, 3, H, W): predicted translations in camera coordinates
             "embed": embed,         # (B, D, H, W): per-pixel embedding feature map
             "conf": confidence,     # (B, 1, H, W): predicted confidence scores
-            "bbox": bbox,           # (B, 4, H, W): predicted bounding-box regression output
             "global_R": global_R,   # (B, 3, 3): rotation matrices in global coordinates (if extrinsics provided)
             "global_trans": global_trans  # (B, 3): translations in global coordinates (if extrinsics provided)
         }

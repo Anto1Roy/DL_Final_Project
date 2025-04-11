@@ -61,7 +61,6 @@ class IPDDatasetMounted(Dataset):
         x_dict_views = []
         Ks = []
         valid_views = []
-        cam_poses = []
 
         for cam_id in self.cam_ids:
             view_dict = {}
@@ -126,46 +125,55 @@ class IPDDatasetMounted(Dataset):
         # === Intrinsics ===
         Ks = torch.stack(Ks)
 
-        # === Ground truth ===
-        primary_cam = valid_views[0]
-        gt_all = json.load(open(self.file_manager.get(f"{base_remote}/scene_gt_{primary_cam}.json")))[fid_key]
-
-        gt_poses = []
+        # === Ground truth for all valid views ===
+        gt_poses_list = []  # This will be a list of lists, one per valid view.
         cad_lookup = {}
 
-        for obj in gt_all:
-            obj_id = int(obj["obj_id"])
-            R = torch.tensor(obj["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
-            t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
-            instance_id = obj.get("instance_id", obj_id)  # optional, fallback to obj_id
+        for cam in valid_views:
+            # Build file path based on the current view.
+            gt_file_path = self.file_manager.get(f"{base_remote}/scene_gt_{cam}.json")
+            # Load the GT data for this camera.
+            gt_data = json.load(open(gt_file_path))
+            # Use fid_key to index the current frame (make sure fid_key is a string, e.g., "1", "2", etc.)
+            gt_all = gt_data.get(fid_key, [])
+            
+            cur_cam_gt_poses = []  # List to store GT poses for this particular view.
+            for obj in gt_all:
+                # Convert object information.
+                obj_id = int(obj["obj_id"])
+                R = torch.tensor(obj["cam_R_m2c"], dtype=torch.float32).reshape(3, 3)
+                t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0  # Conversion from mm to m
+                instance_id = obj.get("instance_id", obj_id)  # Use 'instance_id' if provided; otherwise, fallback to obj_id
 
-            model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-
-            # load CAD model
-            if obj_id not in cad_lookup:
+                # Load CAD model if not already done.
                 model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-                mesh = trimesh.load(model_path, force='mesh')
-                cad_lookup[obj_id] = mesh
+                if obj_id not in cad_lookup:
+                    mesh = trimesh.load(model_path, force='mesh')
+                    cad_lookup[obj_id] = mesh
 
-            obj_id = torch.tensor(obj["obj_id"], dtype=torch.float32)
+                # Convert the object id to a tensor (if necessary).
+                obj_id_tensor = torch.tensor(obj["obj_id"], dtype=torch.float32)
 
-            gt_poses.append({
-                "R": R,
-                "t": t,
-                "obj_id": obj_id,
-                "instance_id": instance_id,
-            })
+                cur_cam_gt_poses.append({
+                    "R": R,
+                    "t": t,
+                    "obj_id": obj_id_tensor,
+                    "instance_id": instance_id,
+                })
+            
+            # Append this camera's GT list to the overall list.
+            gt_poses_list.append(cur_cam_gt_poses)
 
         return {
             "X": {
                 "views": x_dict_views,
                 "K": Ks,
                 "extrinsics": scene_cam_extrinsics,
-                "bbox_info": bbox_info_all,
                 "cad_lookup": cad_lookup,
             },
             "Y": {
-                "gt_poses": gt_poses
+                "gt_poses": gt_poses_list,
+                "bbox_info": bbox_info_all,
             }
         }
 
@@ -173,15 +181,12 @@ class IPDDatasetMounted(Dataset):
 
     def read_img(self, remote_path, modality):
         local_path = self.file_manager.get(remote_path)
-        print(f"Loading {modality.upper()} image from {local_path}")
         if modality == "rgb":
             img = cv2.imread(local_path)
             if img is None:
                 raise FileNotFoundError(f"RGB image not found at {remote_path}")
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # shape: (H, W)
-            print(f"RGB image shape: {img.shape}")
             img = self.transform(img)  # no [:, :, None] needed!
-            print(f"RGB image shape: {img.shape}")
         else:
             flag = cv2.IMREAD_UNCHANGED if modality == "depth" else 0
             img = cv2.imread(local_path, flag)

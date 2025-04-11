@@ -13,7 +13,7 @@ from scipy.optimize import linear_sum_assignment
 
 sys.path.append(os.getcwd())
 from Models.KaolinRenderer import KaolinRenderer
-from Models.PoseEstimatorSeen.PoseEstimation import PoseEstimator
+from Models.ActualPoseEstimator.PoseEstimation import PoseEstimator
 from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Models.helpers import quaternion_to_matrix
 from Metrics.visualization import draw_pose_axes, draw_bbox_from_pose

@@ -12,65 +12,78 @@ class KaolinRenderer(nn.Module):
         self.fov = fov
         self.device = device
 
-    def forward(self, verts, faces, R, T, K=None):
+    def forward(self, verts, faces, R_obj, T_obj, K, cam_extrinsics):
+        """
+        Renders the mesh specified by `verts` and `faces` from the viewpoint given by the camera parameters.
         
-        # Ensure inputs are batched
+        Args:
+            verts: Tensor of shape (V, 3) representing the object mesh vertices.
+            faces: Tensor of shape (F, 3) containing face indices into verts.
+            R_obj: Predicted object pose rotation matrix (global, shape (3,3)).
+            T_obj: Predicted object pose translation vector (global, shape (3,)).
+            K: Camera intrinsics (tensor of shape (3,3)).
+            cam_extrinsics (optional): Dictionary with keys:
+                  "R_w2c": camera rotation from world to camera (tensor (3,3))
+                  "t_w2c": camera translation (tensor (3,))
+                  If provided, it is used to compute the projection.
+        
+        Returns:
+            A rendered image tensor of shape (1, H, W, 3).
+        """
+        # Ensure inputs are batched if necessary.
         if verts.dim() == 2:
-            verts = verts.unsqueeze(0)
+            verts = verts.unsqueeze(0)  # (1, V, 3)
         if faces.dim() == 2:
-            faces = faces.unsqueeze(0)
-        if R.dim() == 2:
-            R = R.unsqueeze(0)
-        if T.dim() == 1:
-            T = T.unsqueeze(0)
+            faces = faces.unsqueeze(0)  # (1, F, 3)
+        if R_obj.dim() == 2:
+            R_obj = R_obj.unsqueeze(0)  # (1, 3, 3)
+        if T_obj.dim() == 1:
+            T_obj = T_obj.unsqueeze(0)  # (1, 3)
 
-        # Camera transformation
-        cam_rot = R[0]  # (3,3)
-        cam_pos = T[0]  # (3,)
+        verts_world = torch.bmm(verts, R_obj.transpose(1, 2)) + T_obj.unsqueeze(1)  # (B, V, 3)
+
+        R_w2c = cam_extrinsics["R_w2c"].to(self.device)  # (3,3)
+        t_w2c = cam_extrinsics["t_w2c"].to(self.device)  # (3,)
         world2cam = torch.eye(4, device=self.device, dtype=verts.dtype)
-        world2cam[:3, :3] = cam_rot.T
-        world2cam[:3, 3] = -cam_rot.T @ cam_pos
+        world2cam[:3, :3] = R_w2c
+        world2cam[:3, 3] = t_w2c
 
-        if K is not None:
-            proj = self.build_projection_from_K(K.squeeze(0))
-        else:
-            proj = self.get_projection_matrix(self.fov, near=0.01, far=10.0).to(self.device)
+        proj = self.build_projection_from_K(K)
 
+        # Combined view-projection matrix.
         VP = proj @ world2cam  # (4,4)
-        verts_b = verts[0].to(self.device)  # (V, 3)
-        face_b = faces[0].to(self.device)   # (F, 3)
 
-        # Convert to homogeneous coordinates
-        ones = torch.ones((verts_b.shape[0], 1), device=self.device, dtype=verts.dtype)
-        verts_homo = torch.cat([verts_b, ones], dim=-1)  # (V,4)
-        verts_cam = verts_homo @ VP.T  # (V,4)
-        verts_ndc = verts_cam[:, :3] / verts_cam[:, 3:].clamp(min=1e-8)
+        # Transform object vertices from world to camera space.
+        ones = torch.ones((verts_world.shape[1], 1), device=self.device, dtype=verts.dtype)
+        verts_world_homo = torch.cat([verts_world[0], ones], dim=-1)  # (V,4) for batch index 0.
+        verts_cam = verts_world_homo @ VP.T  # (V,4)
+        verts_cam_z = verts_cam[:, 2:3].clamp(min=1e-8)
+        verts_ndc = verts_cam[:, :3] / verts_cam_z  # (V,3)
         verts_ndc = torch.nan_to_num(verts_ndc, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Get 2D positions and depth for the faces
+        
+        # Now gather projected vertices for faces.
+        face_b = faces[0].to(self.device)  # (F, 3)
+        # Get 2D positions (x, y) from NDC.
         face_vertices_image = verts_ndc[face_b][:, :, :2].unsqueeze(0).float()  # (1, F, 3, 2)
         face_vertices_z = verts_ndc[face_b][:, :, 2].unsqueeze(0).float()       # (1, F, 3)
-
-        # ----- Improved Shading with Lambertian Term -----
-        # Compute face normals from triangle vertices in camera space.
-        tri_verts = verts_b[face_b]  # (F, 3, 3)
+        
+        # --- Lambertian shading ---
+        verts_cam_space = verts_world[0] @ world2cam[:3, :3].T + world2cam[:3, 3]  # (V,3)
+        tri_verts = verts_cam_space[face_b]  # (F, 3, 3)
         v1 = tri_verts[:, 1] - tri_verts[:, 0]
         v2 = tri_verts[:, 2] - tri_verts[:, 0]
-        normals = torch.cross(v1, v2, dim=-1)  # (F, 3)
+        normals = torch.cross(v1, v2, dim=-1)  # (F,3)
         normals = normals / (normals.norm(dim=-1, keepdim=True) + 1e-8)
-        
-        # Define a light direction (e.g., coming from the camera)
+        # Light is assumed to come from the camera (z-axis)
         light_dir = torch.tensor([0, 0, 1.0], device=self.device, dtype=verts.dtype)
         lambert = torch.clamp((normals @ light_dir), min=0.0)  # (F,)
-        # Reshape and broadcast for each face and each vertex
-        lambert = lambert.view(1, -1, 1, 1)  # (1, F, 1, 1)
+        lambert = lambert.view(1, -1, 1, 1)
         
-        # Define a base color. For example, red:
+        # Base color (e.g., red)
         base_color = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=verts.dtype).view(1, 1, 3, 1)
-        # Repeat for all faces:
         face_features = base_color.repeat(1, face_b.shape[0], 1, 1) * lambert
-        # ---------------------------------------------------
 
+        # Rasterize faces.
         rast_out, _ = rasterize(
             height=self.height,
             width=self.width,
@@ -93,7 +106,7 @@ class KaolinRenderer(nn.Module):
         return proj
 
     def build_projection_from_K(self, K):
-        # Convert intrinsic parameters to scalars with .item()
+        # K is assumed to be (3,3).
         fx, fy = K[0, 0].item(), K[1, 1].item()
         cx, cy = K[0, 2].item(), K[1, 2].item()
         w, h = self.width, self.height
@@ -105,32 +118,3 @@ class KaolinRenderer(nn.Module):
             [0,          0,         -1,                0]
         ], dtype=torch.float32, device=self.device)
         return proj
-
-    def render_mesh(self, verts, faces, R, T, K, background="white", resolution=None):
-        if resolution:
-            self.height, self.width = resolution
-
-        image_tensor = self.forward(verts, faces, R, T, K)
-        return image_tensor[0].permute(2, 0, 1)  # (3, H, W)
-
-    def render_scene(self, meshes, K, background="white", resolution=None):
-        if resolution:
-            self.height, self.width = resolution
-
-        if background == "white":
-            bg = torch.ones((1, self.height, self.width, 3), device=self.device, dtype=torch.float32)
-        else:
-            bg = background.unsqueeze(0).to(self.device)
-
-        composite = bg.clone()
-        alpha = 0.5
-
-        for mesh in meshes:
-            verts = mesh['verts']
-            faces = mesh['faces']
-            R = mesh['R']
-            T = mesh['T']
-            rendered = self.forward(verts, faces, R, T, K)
-            composite = alpha * rendered + (1 - alpha) * composite
-
-        return composite[0].permute(2, 0, 1)

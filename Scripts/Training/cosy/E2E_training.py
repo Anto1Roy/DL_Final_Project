@@ -1,43 +1,71 @@
+# pose_training_fused.py
+import json
 import os
 import sys
-import json
 import yaml
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader, SubsetRandomSampler
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, SubsetRandomSampler
 
-# Local
 sys.path.append(os.getcwd())
 from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Classes.EarlyStopping import EarlyStopping
-from Models.PoseEstimator import TwoStagePoseEstimator
+from Models.CosyPose.PoseEstimator import TwoStagePoseEstimator
 
-def save_checkpoint(state, filename):
-    torch.save(state, filename)
 
-def custom_collate_fn(batch):
-    batch = [sample for sample in batch if sample is not None]
-    if len(batch) == 0:
-        return None
-    return batch
+def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="checkpoint_pose_fused.pt"):
+    # os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scaler_state': scaler.state_dict()
+    }, path)
+    print(f"[INFO] Saved checkpoint to {path}")
 
-def load_checkpoint(filepath, model, optimizer, scaler, scheduler):
-    if os.path.exists(filepath):
-        print(f"\nLoading checkpoint from {filepath}\n")
-        checkpoint = torch.load(filepath)
+
+def load_checkpoint(model, optimizer, scaler, path="weights/checkpoint_pose_fused.pt"):
+    if os.path.exists(path):
+        checkpoint = torch.load(path)
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scaler.load_state_dict(checkpoint["scaler_state"])
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-        start_epoch = checkpoint["epoch"] + 1
-        epoch_seed = checkpoint.get("epoch_seed", start_epoch)
-        return start_epoch, epoch_seed
-    return 0, 0
+        print(f"[INFO] Loaded checkpoint from {path}")
+        return checkpoint["epoch"], checkpoint.get("batch_idx", 0)
+    else:
+        print("[INFO] No checkpoint found. Starting from scratch.")
+        return 0, 0
+
+
+def custom_collate_fn(batch):
+    return [s for s in batch if s is not None]
+
+def move_sample_to_device(sample, device):
+    X, Y = sample["X"], sample["Y"]
+
+    for view in X["views"]:
+        for k in view:
+            view[k] = view[k].to(device)
+
+    X["K"] = X["K"].to(device)
+
+    for gt_list in Y["gt_poses"]:
+        for pose in gt_list:
+            pose["R"] = pose["R"].to(device)
+            pose["t"] = pose["t"].to(device)
+            pose["obj_id"] = pose["obj_id"].to(device)
+
+    for extr in X.get("extrinsics", []):
+        extr["R_w2c"] = extr["R_w2c"].to(device)
+        extr["t_w2c"] = extr["t_w2c"].to(device)
+
+    return sample
+
+
 
 def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "Config/config_fusenet.yaml"
@@ -47,223 +75,178 @@ def main():
     remote_base_url = config["dataset"]["remote_base_url"]
     cam_ids = config["dataset"]["cam_ids"]
     modalities = config["dataset"].get("modality", ["rgb", "depth"])
-    train_split = config["dataset"].get("train_split", "train")
-    val_split = config["dataset"].get("val_split", "val")
-    batch_size = int(config["training"]["batch_size"])
-    epochs = int(config["training"]["epochs"])
-    num_workers = int(config["training"]["num_workers"])
-    device = torch.device(config["training"].get("device", "cuda") if torch.cuda.is_available() else "cpu")
+    batch_size = config["training"]["batch_size"]
+    epochs = config["training"]["epochs"]
+    num_workers = config["training"]["num_workers"]
     lr = float(config["optim"].get("lr", 1e-4))
     encoder_type = config["training"].get("encoder", "fusenet")
+    fusion_type = config["training"].get("fusion", "concat")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    renderer_config = config["renderer"]
 
     patience = config["training"].get("patience", 10)
-    renderer_config = config.get("renderer", {"width": 640, "height": 480, "device": device})
-
-    torch.backends.cudnn.benchmark = True
+    checkpoint_index = config["training"].get("checkpoint_index", 50)
+    val_every = float(config["training"].get("val_every", 50))
+    checkpoint_file = f"pose_checkpoint_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.pt"
+    model_path = f"weights/pose_model_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.pt"
 
     train_scene_ids = {f"{i:06d}" for i in range(0, 25)}
-    test_scene_ids = {f"{i:06d}" for i in range(25, 50)}
-
     train_obj_ids = {0, 8, 18, 19, 20}
-    test_obj_ids = {1, 4, 10, 11, 14}
 
-    dataset = IPDDatasetMounted(remote_base_url, cam_ids, modalities, split=train_split,
-                                 allowed_obj_ids=train_obj_ids, allowed_scene_ids=train_scene_ids)
+    dataset = IPDDatasetMounted(remote_base_url, cam_ids, modalities,
+                                 split=config["dataset"].get("val_split", "train"),
+                                #  allowed_scene_ids=train_scene_ids,
+                                #  allowed_obj_ids=train_obj_ids
+                                 )
 
-    valid_size = 0.2
-    num_train = len(dataset)
-    indices = list(range(num_train))
+    indices = list(range(len(dataset)))
     np.random.shuffle(indices)
-    split_idx = int(valid_size * num_train)
-    train_idx, valid_idx = indices[split_idx:], indices[:split_idx]
+    val_split = int(0.2 * len(dataset))
+    train_idx, val_idx = indices[val_split:], indices[:val_split]
 
-    train_sampler = SubsetRandomSampler(train_idx)
-    valid_sampler = SubsetRandomSampler(valid_idx)
-
-    train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler,
+    train_loader = DataLoader(dataset, batch_size=batch_size,
+                              sampler=SubsetRandomSampler(train_idx),
                               num_workers=num_workers, collate_fn=custom_collate_fn)
-    valid_loader = DataLoader(dataset, batch_size=batch_size, sampler=valid_sampler,
+    valid_loader = DataLoader(dataset, batch_size=batch_size,
+                              sampler=SubsetRandomSampler(val_idx),
                               num_workers=num_workers, collate_fn=custom_collate_fn)
 
     sensory_channels = {mod: 1 for mod in modalities}
     model = TwoStagePoseEstimator(
-        sensory_channels=sensory_channels,
-        renderer_config=renderer_config,
-        encoder_type=encoder_type
+        sensory_channels, renderer_config, encoder_type
     ).to(device)
 
-    if config["training"].get("freeze_candidates", False):
-        model.freeze_candidates()
-
-    if config["training"].get("freeze_refiner", False):
-        model.freeze_refiner()
-
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
     scaler = GradScaler()
-    early_stopping = EarlyStopping(patience=patience, verbose=True, path="checkpoint.pt")
 
-    start_epoch, epoch_seed = 0, 0 #load_checkpoint("checkpoint.pth", model, optimizer, scaler, scheduler)
+    early_stopping = EarlyStopping(patience=patience, verbose=True, path=model_path)
 
-    batch_train_losses = []
-    batch_valid_losses = []
 
-    print("\n------Training------")
+    # start_epoch, _ = load_checkpoint(model, optimizer, scaler, path=checkpoint_file)
+
+    start_epoch = 0
+
+    loss_log = {
+        'batch_idx': [],
+        'epoch': [],
+        'loss': [],
+    }
+
+    save_path =f"Logs/loss_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.json"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
     for epoch in range(start_epoch, epochs):
+        if early_stopping.early_stop:
+            print("[EARLY STOPPING TRIGGERED] Skipping Epochs.")
+            break
         model.train()
-        train_loss = 0.0
-        train_sample = 0
-        for batch_idx, batch in enumerate(train_loader):
-            if batch is None:
+        total_rot_loss, total_trans_loss, total_samples = 0, 0, 0
+        index = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            if not batch:
                 continue
 
-            if batch_idx > 20:
-                break
+            index += 1
 
-            batch_avg_loss = []
-            batch_avg_render_loss = []
-            batch_avg_add_s_loss = []
+            optimizer.zero_grad()
+            losses = []
+            trans_loss_avg = 0.0
+            sample_avg = 0
+
+            # try:
 
             for sample in batch:
-                if sample is None:
-                    continue
+                sample = move_sample_to_device(sample, device)
 
-                x_dict_views = sample["views"]
-                Ks = sample["K"].to(device)
-                R_gt = [R.to(device) for R in sample["R_gt"]]
-                t_gt = [t.to(device) for t in sample["t_gt"]]
-                instance_ids = [int(i) for i in sample["instance_ids"]]
-                cad_models = [(v.to(device), f.to(device)) for v, f in sample["cad_models"]]
-
-                x_dict_views = [
-                    {mod: tensor.to(device) for mod, tensor in views.items()}
-                    for views in x_dict_views
-                ]
-
+                X, Y = sample["X"], sample["Y"]
+                # try:
                 with autocast():
-                    loss, render_loss, add_s_loss = model.compute_loss(
-                        x_dict_views=x_dict_views,
-                        K_list=Ks,
-                        cad_model_data=cad_models,
-                        R_gt_list=R_gt,
-                        t_gt_list=t_gt,
-                        instance_id_list=instance_ids
+                    total_loss = model.compute_loss(
+                        x_dict_views=X["views"],
+                        R_gt_list=[[pose["R"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                        t_gt_list=[[pose["t"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                        gt_obj_ids=[[pose["obj_id"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                        K_list=X["K"],
+                        extrinsics=X["extrinsics"],
+                        bbox_gt_list=Y["bbox_info"] # incorporated after the oral
                     )
 
-                batch_avg_loss.append(loss)
-                batch_avg_render_loss.append(render_loss.item())
-                batch_avg_add_s_loss.append(add_s_loss.item())
+                # except Exception as e:
+                #     print(f"[ERROR] {e}")
+                #     break
 
-            # Average the batch loss
-            avg_loss = torch.stack(batch_avg_loss).mean()  # keeps gradient + stays on GPU
-            batch_avg_render_loss = np.mean(batch_avg_render_loss)
-            batch_avg_add_s_loss = np.mean(batch_avg_add_s_loss)
+                losses.append(total_loss)
+                sample_avg += 1
 
-            print(f"Batch {batch_idx} | Loss: {avg_loss.item():.4f} | ADD Loss: {batch_avg_add_s_loss:.4f} | Render Loss: {batch_avg_render_loss:.4f}")
-            
-            scaler.scale(avg_loss).backward()
+            mean_loss = torch.stack(losses).mean()
+            scaler.scale(mean_loss).backward()
             scaler.step(optimizer)
+            scheduler.step(mean_loss)
             scaler.update()
+            # except Exception as e:
+            #     print(f"[ERROR] {e}")
+            #     continue
 
-            train_loss += loss.item()
-            train_sample += 1
-            batch_train_losses.append({
-                "epoch": epoch,
-                "batch": batch_idx,
-                "total_loss": loss.item(),
-                "trans_loss": add_s_loss.item() if add_s_loss is not None else 0,
-                "render_loss": render_loss.item() if render_loss is not None else 0
-            })
+            print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f}")
 
-        avg_train_loss = train_loss / train_sample
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f}")
+            loss_log['batch_idx'].append(index)
+            loss_log['epoch'].append(epoch+1)
+            loss_log['loss'].append(total_loss.item())
 
-        model.eval()
-        valid_loss = 0.0
-        valid_sample = 0
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(valid_loader):
-                if batch is None:
-                    continue
+            if index % checkpoint_index == 0:
+                save_checkpoint(model, optimizer, scaler, epoch, index, path=checkpoint_file)
 
-                if batch_idx > 10:
-                    break
-
-                batch_avg_loss = []
-                batch_avg_render_loss = []
-                batch_avg_add_s_loss = []
-
-                for sample in batch:
-                    if sample is None:
+            if index % val_every == 0:
+                eval = False
+                model.eval()
+                for val_batch in valid_loader:
+                    if not val_batch:
                         continue
+                    for val_sample in val_batch:
+                        sample = move_sample_to_device(val_sample, device)
 
-                    x_dict_views = sample["views"]
-                    Ks = sample["K"].to(device)
-                    R_gt = [R.to(device) for R in sample["R_gt"]]
-                    t_gt = [t.to(device) for t in sample["t_gt"]]
-                    instance_ids = [int(i) for i in sample["instance_ids"]]
-                    cad_models = [(v.to(device), f.to(device)) for v, f in sample["cad_models"]]
+                        X, Y = sample["X"], sample["Y"]
+                        try:
+                            with torch.no_grad():
+                                total_loss = model.compute_loss(
+                                    x_dict_views=X["views"],
+                                    R_gt_list=[[pose["R"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                    t_gt_list=[[pose["t"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                    gt_obj_ids=[[pose["obj_id"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                    K_list=X["K"],
+                                    extrinsics=X["extrinsics"],
+                                    bbox_gt_list=Y["bbox_info"] # incorporated after the oral
+                                )
 
-                    x_dict_views = [
-                        {mod: tensor.to(device) for mod, tensor in views.items()}
-                        for views in x_dict_views
-                    ]
+                        except Exception as e:
+                            print(f"[ERROR] {e}")
+                            break
 
-                    loss, render_loss, add_s_loss = model.compute_loss(
-                        x_dict_views=x_dict_views,
-                        K_list=Ks,
-                        cad_model_data=cad_models,
-                        R_gt_list=R_gt,
-                        t_gt_list=t_gt,
-                        instance_id_list=instance_ids
-                    )
+                        losses.append(total_loss)
+                        sample_avg += 1
+                        eval = True
 
-                    batch_avg_loss.append(loss)
-                    batch_avg_render_loss.append(render_loss.item())
-                    batch_avg_add_s_loss.append(add_s_loss.item())
+                    if eval:
+                        mean_loss = torch.stack(losses).mean()
+                        early_stopping(mean_loss.item(), model)
+                        break
 
-                avg_loss = torch.stack(batch_avg_loss).mean()  # keeps gradient + stays on GPU
-                batch_avg_render_loss = np.mean(batch_avg_render_loss)
-                batch_avg_add_s_loss = np.mean(batch_avg_add_s_loss)
+                model.train()
 
-                valid_loss += batch_avg_loss.item()
-                valid_sample += 1
+            if early_stopping.early_stop:
+                print("[EARLY STOPPING TRIGGERED] Stopping training early based on training loss.")
+                break
+        with open(save_path, "w") as f:
+            json.dump(loss_log, f, indent=4)
 
-                batch_valid_losses.append({
-                    "epoch": epoch,
-                "batch": batch_idx,
-                "total_loss": batch_avg_loss,
-                "trans_loss": batch_avg_add_s_loss if batch_avg_add_s_loss is not None else 0,
-                "render_loss": batch_avg_render_loss if batch_avg_render_loss is not None else 0
-                })
+        total_trans_loss += trans_loss_avg
+        total_samples += sample_avg
 
-                print(f"[VAL] Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} | ADD Loss: {add_s_loss.item():.4f}")
+        print(f"Epoch {epoch+1} | Rot Loss: {total_rot_loss/total_samples:.4f}, "
+              f"Trans Loss: {total_trans_loss/total_samples:.4f}")
 
-        avg_valid_loss = valid_loss / len(valid_loader)
-        print(f"Validation Loss: {avg_valid_loss:.4f}")
-        scheduler.step(avg_valid_loss)
-        early_stopping(avg_valid_loss, model)
-
-        if early_stopping.early_stop:
-            print("Early stopping triggered.")
-            break
-
-        with open("loss_log.json", "w") as f:
-            json.dump({
-                "train": batch_train_losses,
-                "valid": batch_valid_losses
-            }, f, indent=2)
-        print("[INFO] Saved batch loss logs to loss_log.json.")
-
-        save_checkpoint({
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scaler_state": scaler.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "epoch_seed": epoch_seed + 1
-        }, "checkpoint.pth")
-        epoch_seed += 1
+        save_checkpoint(model, optimizer, scaler, epoch, 0, path=checkpoint_file)
 
 if __name__ == "__main__":
     torch.multiprocessing.set_start_method('spawn', force=True)

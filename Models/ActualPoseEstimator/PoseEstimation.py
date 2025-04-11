@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from Models.ObjectDetection.GridObjectDetector import GridObjectDetector
 from Models.Encoding.FuseNet.FuseNet import FuseNetFeatureEncoder
 from Models.Encoding.ResNet34 import ResNetFeatureEncoder
-from Models.PoseEstimatorSeen.TransformerFusion import TransformerFusion
+from Models.ActualPoseEstimator.TransformerFusion import TransformerFusion
 from Models.helpers import hungarian_matching, quaternion_to_matrix
 from scipy.optimize import linear_sum_assignment
 
@@ -79,20 +79,20 @@ class PoseEstimator(nn.Module):
         total_conf_loss = 0.0
         total_matches = 0
 
-        bbox_loss = 0.
-        for i, (bbox_pred, bbox_gt_view) in enumerate(zip(bbox_preds, bbox_gt_list)):
-            B, _, H, W = bbox_pred.shape
-            for b in range(B):
+        # bbox_loss = 0.
+        # for i, (bbox_pred, bbox_gt_view) in enumerate(zip(bbox_preds, bbox_gt_list)):
+        #     B, _, H, W = bbox_pred.shape
+        #     for b in range(B):
 
-                pred = bbox_pred[b].permute(1, 2, 0)  # [H, W, 4]
+        #         pred = bbox_pred[b].permute(1, 2, 0)  # [H, W, 4]
 
-                center_h = H // 2
-                center_w = W // 2
-                pred_box = pred[center_h, center_w]
+        #         center_h = H // 2
+        #         center_w = W // 2
+        #         pred_box = pred[center_h, center_w]
 
-                if b < len(bbox_gt_view.get("bbox_visib_list", [])):
-                    gt_box = torch.tensor(bbox_gt_view["bbox_visib_list"][b], dtype=torch.float32, device=device)
-                    bbox_loss += F.l1_loss(pred_box, gt_box) # proposed by TA
+        #         if b < len(bbox_gt_view.get("bbox_visib_list", [])):
+        #             gt_box = torch.tensor(bbox_gt_view["bbox_visib_list"][b], dtype=torch.float32, device=device)
+        #             bbox_loss += F.l1_loss(pred_box, gt_box) # proposed by TA
 
 
         # Group GTs by object ID
@@ -152,18 +152,48 @@ class PoseEstimator(nn.Module):
             )
 
         if total_matches == 0:
-            zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero, zero, zero, zero, zero
+            all_gt_Rs = []
+            all_gt_ts = []
+                
+            R_c2w = extrinsics[0]["R_w2c"].T
+            t_c2w = -R_c2w @ extrinsics[0]["t_w2c"]
+
+            for i in range(len(R_gt_list[view_idx])):
+                R_gt = R_gt_list[view_idx][i].to(device)
+                t_gt = t_gt_list[view_idx][i].to(device)
+                R_gt_global = R_cam.T @ R_gt
+                t_gt_global = R_cam.T @ (t_gt - t_c2w)
+                all_gt_Rs.append(R_gt_global)
+                all_gt_ts.append(t_gt_global)
+
+            if len(all_gt_Rs) == 0 or quat.shape[0] == 0:
+                zero = torch.tensor(0.0, device=device, requires_grad=True)
+                return zero, zero, zero, zero, zero
+            
+            avg_R_gt = torch.stack(all_gt_Rs).mean(dim=0)
+            avg_t_gt = torch.stack(all_gt_ts).mean(dim=0)
+
+            # Average predicted pose
+            avg_R_pred = pred_Rs.mean(dim=0)
+            avg_t_pred = trans.mean(dim=0)
+
+            avg_rot = F.mse_loss(avg_R_pred, avg_R_gt)
+            avg_trans = F.mse_loss(avg_t_pred, avg_t_gt)
+            avg_class = torch.tensor(0.0, device=device)
+            avg_conf = F.binary_cross_entropy_with_logits(conf, torch.zeros_like(conf))
+
+            total_loss = avg_rot + avg_trans + avg_class + avg_conf
+            return total_loss, avg_rot, avg_trans, avg_class, avg_conf
 
         avg_rot = total_rot_loss / total_matches
         avg_trans = total_trans_loss / total_matches
         avg_class = total_class_loss / total_matches
         avg_conf = total_conf_loss / len(conf)
         
-        avg_bbox = bbox_loss / len(bbox_gt_list) if bbox_gt_list is not None else torch.tensor(0.0, device=device)
-        total_loss = avg_rot + avg_trans + avg_class + avg_conf + avg_bbox 
+        # avg_bbox = bbox_loss / len(bbox_gt_list) if bbox_gt_list is not None else torch.tensor(0.0, device=device)
+        total_loss = avg_rot + avg_trans + avg_class + avg_conf
 
-        return total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_bbox
+        return total_loss, avg_rot, avg_trans, avg_class, avg_conf
 
 
 

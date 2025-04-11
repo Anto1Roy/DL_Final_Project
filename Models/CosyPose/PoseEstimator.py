@@ -19,7 +19,8 @@ def pose_distance(R1, t1, R2, t2):
 
 class TwoStagePoseEstimator(nn.Module):
     def __init__(self, sensory_channels, renderer_config, encoder_type="resnet",
-                 num_candidates=32, noise_level=0.05, conf_thresh=0.5):
+                 num_candidates=32, noise_level=0.05, conf_thresh=0.5
+                 ):
         super().__init__()
         self.num_candidates = num_candidates
         self.noise_level = noise_level
@@ -33,17 +34,15 @@ class TwoStagePoseEstimator(nn.Module):
             self.encoder = FuseNetFeatureEncoder(sensory_channels=sensory_channels, ngf=self.out_dim)
 
         self.det_head = CandidatePoseModel(feature_dim=self.out_dim)
-        # Bbox head to predict 2D boxes from per-view feature maps
-        self.bbox_head = nn.Conv2d(self.out_dim, 4, kernel_size=1)
-        self.refiner = CosyPoseStyleRenderMatch(renderer_config, num_candidates=num_candidates)
+        self.refiner = CosyPoseStyleRenderMatch(renderer_config)
         self.matcher = MultiViewMatcher(pose_threshold=0.1)
         self.global_refiner = SceneRefiner(renderer_config)
 
     def extract_single_view_features(self, x_dict):
         return self.encoder(x_dict)
 
-    def detect_single_view(self, feat_map, top_k=15):
-        outputs = self.det_head.forward(feat_map)
+    def detect_single_view(self, feat_map, extrinsics, top_k=15):
+        outputs = self.det_head.forward(feat_map, extrinsics=extrinsics)
         detections_per_sample = self.det_head.decode_poses(outputs, top_k=top_k)
         filtered = [
             [d for d in dets if d.get("score", 1.0) >= self.conf_thresh]
@@ -52,11 +51,6 @@ class TwoStagePoseEstimator(nn.Module):
         return filtered, outputs
 
     def sample_candidates(self, detections):
-        """
-        For each detection in a view, sample candidate poses.
-        Returns a list (one element per detection) where each element is a tensor of shape (num_candidates, 4, 4)
-        representing candidate poses (in camera coordinates).
-        """
         candidates_all = []
         for det in detections:
             quat = det["quat"].unsqueeze(0).expand(self.num_candidates, -1)
@@ -72,129 +66,117 @@ class TwoStagePoseEstimator(nn.Module):
             candidates_all.append(poses)
         return candidates_all
 
-    def match_gt_with_detections_across_views(self, detections_per_view, R_gt_tensor,
-                                              t_gt_tensor, instance_id_list, sample_indices,
-                                              feat_maps, Ks):
-        matched_detections = []
-        matched_gt_R, matched_gt_t, matched_ids, matched_feat, matched_K = [], [], [], [], []
+    def compute_loss(self, x_dict_views, K_list, cad_model_lookup, R_gt_list, t_gt_list,
+                 instance_id_list, extrinsics):
+        device = K_list[0].device
 
-        objects_by_id = defaultdict(list)
-        for i in range(len(sample_indices)):
-            sample_idx = sample_indices[i].item()
-            obj_id = instance_id_list[i]
-            objects_by_id[obj_id].append((sample_idx, R_gt_tensor[i], t_gt_tensor[i]))
-
-        for obj_id, gt_info_list in objects_by_id.items():
-            for sample_idx, R_gt, t_gt in gt_info_list:
-                dets = detections_per_view[sample_idx]
-                best_match, best_dist = None, float('inf')
-                for det in dets:
-                    quat = det["quat"]
-                    t_pred = det["trans"]
-                    R_pred = quaternion_to_matrix(quat.unsqueeze(0))[0]
-                    dist = torch.norm(R_gt - R_pred) + torch.norm(t_gt - t_pred)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_match = det
-                if best_match is not None:
-                    matched_detections.append(best_match)
-                    matched_gt_R.append(R_gt)
-                    matched_gt_t.append(t_gt)
-                    matched_ids.append(obj_id)
-                    matched_feat.append(feat_maps[sample_idx])
-                    matched_K.append(Ks[sample_idx])
-        return matched_detections, matched_gt_R, matched_gt_t, matched_ids, matched_feat, matched_K
-
-    def compute_loss(self, x_dict_views, K_list, cad_model_data, R_gt_list, t_gt_list,
-                     instance_id_list, cad_model_lookup, extrinsics):
-        """
-        Global refinement loss based on multi-view matching.
-        """
-        # Stage 1: Extract features per view.
+        # -----------------------------
+        # Stage 1: Feature extraction.
+        # -----------------------------
         feat_maps = [
             self.extract_single_view_features({mod: view[mod].unsqueeze(0) for mod in view})
             for view in x_dict_views
         ]
-        # Stage 2: Detection (for each view, select first detection)
-        detections_per_view = [self.detect_single_view(fm, top_k=25)[0][0] for fm in feat_maps]
-        # Stage 3: Multi-view hypothesis matching.
-        object_groups = self.matcher.match(detections_per_view, feat_maps, K_list, extrinsics)
-        # Stage 4: Global scene refinement.
-        total_loss, render_losses, add_s = self.global_refiner.compute_loss(
-            object_groups,
-            cad_model_lookup={obj_id: cad_model_data[i] for i, obj_id in enumerate(instance_id_list)},
-            gt_R_tensor=torch.stack(R_gt_list) if R_gt_list else None,
-            gt_t_tensor=torch.stack(t_gt_list) if t_gt_list else None,
-            instance_id_list=instance_id_list
-        )
+        
+        # -----------------------------
+        # Stage 2: Detection on each view.
+        # -----------------------------
+        detections_per_view = [self.detect_single_view(feat_map, extrinsics[i], top_k=25)[0][0] for (i, feat_map) in enumerate(feat_maps)]
+        
+        # -----------------------------
+        # Stage 3: Multi-view detection merging.
+        # -----------------------------
+        merged_detections = self.matcher.match(detections_per_view, K_list, extrinsics)
+        
+        # -----------------------------
+        # Stage 4: Build GT view dictionaries.
+        # -----------------------------
+        gt_views = []
+        for view_idx, (R_gts, t_gts) in enumerate(zip(R_gt_list, t_gt_list)):
+            if len(R_gts) == 0:
+                continue  
+            gt_view = {
+                'view_id': view_idx,
+                'K': K_list[view_idx],
+                'cam_extrinsics': extrinsics[view_idx],
+                'instance_id': instance_id_list[view_idx],
+                'rendered_gt': torch.zeros((1, 1, self.global_refiner.renderer.height,
+                                            self.global_refiner.renderer.width), device=device)
+            }
+            gt_views.append(gt_view)
+            
+        # -----------------------------
+        # Stage 5: Global scene refinement.
+        # -----------------------------
+        refined = self.global_refiner.refine_scene(merged_detections, gt_views, cad_model_lookup)
+        
+        # -----------------------------
+        # Stage 6: Compute a supervision loss.
+        # -----------------------------
+        total_loss = torch.tensor(0.0, device=device)
+        num_losses = 0
+        for gt_view in gt_views:
+            view_idx = gt_view["view_id"]
+            if len(R_gt_list[view_idx]) == 0:
+                continue
+            gt_R = R_gt_list[view_idx][0].to(device)
+            gt_t = t_gt_list[view_idx][0].to(device)
+            for r in refined:
+                if r["instance_id"] == gt_view["instance_id"]:
+                    R_refined = quaternion_to_matrix(r["quat"].unsqueeze(0))[0]
+                    t_refined = r["trans"]
+                    total_loss += pose_distance(R_refined, t_refined, gt_R, gt_t)
+                    num_losses += 1
+                    break
+                    
+        if num_losses > 0:
+            total_loss = total_loss / num_losses
+
+        render_losses = torch.tensor(0.0, device=device)
+        add_s = torch.tensor(0.0, device=device)
+        
         return total_loss, render_losses, add_s
+
 
     def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, gt_obj_ids,
                           K_list, extrinsics, bbox_gt_list=None):
-        """
-        Computes the auxiliary loss for the detection stage and candidate sampling,
-        converting both GT and candidate poses to global (world) coordinates using the camera extrinsics.
-        
-        Args:
-            x_dict_views: List of dicts per view {modality -> Tensor(C,H,W)}.
-            R_gt_list: Nested list per view, list of GT rotation matrices (Tensor(3,3)).
-            t_gt_list: Nested list per view, list of GT translation vectors (Tensor(3)).
-            gt_obj_ids: Nested list per view, list of GT object IDs.
-            K_list: List/Tensor of camera intrinsics (one per view).
-            extrinsics: List of dicts, one per view, with keys "R_w2c" and "t_w2c" (in camera coords).
-            bbox_gt_list: List of dicts (per view) containing ground-truth bounding boxes under "bbox_visib_list".
-        
-        Returns:
-            total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_bbox
-        """
         device = K_list[0].device
 
-        # Stage A: Extract per-view features.
         feat_maps = [
-            self.extract_single_view_features({mod: view[mod].unsqueeze(0) for mod in view})
+            self.extract_single_view_features({mod: view[mod] for mod in view})
             for view in x_dict_views
         ]
 
-        # Auxiliary bounding box loss computed from each view’s feature map.
-        bbox_loss = torch.tensor(0.0, device=device)
-        if bbox_gt_list is not None:
-            for i, (feat_map, bbox_gt_view) in enumerate(zip(feat_maps, bbox_gt_list)):
-                pred_bbox_map = self.bbox_head(feat_map)  # [1, 4, H, W]
-                _, _, H, W = pred_bbox_map.shape
-                pred_bbox_map = pred_bbox_map[0].permute(1, 2, 0)  # [H, W, 4]
-                center_h = H // 2
-                center_w = W // 2
-                pred_box = pred_bbox_map[center_h, center_w]  # (4,)
-                if bbox_gt_view is not None and "bbox_visib_list" in bbox_gt_view and len(bbox_gt_view["bbox_visib_list"]) > 0:
-                    gt_box = torch.tensor(bbox_gt_view["bbox_visib_list"][0],
-                                          dtype=torch.float32, device=device)
-                    bbox_loss += F.l1_loss(pred_box, gt_box)
-
-        # Stage B: Candidate sampling from each view using CosyPose Stage 1.
         all_pred_Rs = []
         all_pred_ts = []
         for i, feat_map in enumerate(feat_maps):
-            # Get detections from the current view (top_k = 5)
-            detections_batch, _ = self.detect_single_view(feat_map, top_k=5)
+            detections_batch, _ = self.detect_single_view(feat_map, extrinsics[i], top_k=25)
             detections = detections_batch[0]  # list of detections for this view
             if len(detections) == 0:
                 continue
-            # Sample candidates for each detection
+
+            # Get extrinsics from the current view (assumed shape: R_w2c: (3,3), t_w2c: (3,))
             candidates_per_detection = self.sample_candidates(detections)
-            # Get extrinsics for this view
             R_w2c = extrinsics[i]["R_w2c"].to(device)  # (3,3)
             t_w2c = extrinsics[i]["t_w2c"].to(device)  # (3,)
+
             for cand in candidates_per_detection:
-                # cand: tensor of shape (num_candidates, 4, 4) in camera coordinates.
                 num_candidates = cand.shape[0]
-                R_candidates = cand[:, :3, :3]
-                t_candidates = cand[:, :3, 3]
-                # Convert each candidate from camera to global (world) coordinates:
-                # R_global = R_w2c^T @ R_candidate; t_global = R_w2c^T @ (t_candidate - t_w2c)
-                R_global = torch.matmul(R_w2c.T.unsqueeze(0).expand(num_candidates, -1, -1), R_candidates)
-                t_global = torch.matmul(R_w2c.T.unsqueeze(0).expand(num_candidates, -1), (t_candidates - t_w2c).unsqueeze(-1)).squeeze(-1)
+                R_candidates = cand[:, :3, :3]  # (num_candidates, 3, 3)
+                t_candidates = cand[:, :3, 3]   # (num_candidates, 3)
+
+                # Compute the transpose of R_w2c.
+                R_w2c_T = R_w2c.transpose(0, 1)  # (3, 3)
+                R_w2c_exp = R_w2c_T.unsqueeze(0).expand(num_candidates, R_w2c_T.size(0), R_w2c_T.size(1))
+                
+                R_global = torch.matmul(R_w2c_exp, R_candidates)  # (num_candidates, 3, 3)
+                
+                t_diff = (t_candidates - t_w2c).unsqueeze(-1)  # (num_candidates, 3, 1)
+                t_global = torch.matmul(R_w2c_exp, t_diff).squeeze(-1)  # (num_candidates, 3)
+                
                 all_pred_Rs.append(R_global)
                 all_pred_ts.append(t_global)
+
 
         if len(all_pred_Rs) == 0:
             zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -211,9 +193,12 @@ class TwoStagePoseEstimator(nn.Module):
             R_w2c = extrinsics[view_idx]["R_w2c"].to(device)
             t_w2c = extrinsics[view_idx]["t_w2c"].to(device)
             for R_gt, t_gt in zip(view_Rs, view_ts):
-                # Convert GT: R_global = R_w2c^T @ R_gt; t_global = R_w2c^T @ (t_gt - t_w2c)
                 gt_R_list_flat.append(torch.matmul(R_w2c.T, R_gt.to(device)))
                 gt_t_list_flat.append(torch.matmul(R_w2c.T, (t_gt.to(device) - t_w2c).unsqueeze(-1)).squeeze(-1))
+
+        if len(gt_R_list_flat) == 0 or len(gt_t_list_flat) == 0:
+            zero = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero, zero, zero, zero, zero
         gt_Rs = torch.stack(gt_R_list_flat)  # (N_gt, 3, 3)
         gt_ts = torch.stack(gt_t_list_flat)    # (N_gt, 3)
 
@@ -241,14 +226,12 @@ class TwoStagePoseEstimator(nn.Module):
         # For the two-stage estimator, we do not have classification or confidence losses.
         avg_class = torch.tensor(0.0, device=device)
         avg_conf = torch.tensor(0.0, device=device)
-        avg_bbox = bbox_loss / len(bbox_gt_list) if bbox_gt_list is not None and len(bbox_gt_list) > 0 else torch.tensor(0.0, device=device)
 
-        total_loss = avg_rot + avg_trans + 0.1 * avg_bbox
+        total_loss = avg_rot + avg_trans + avg_class + avg_conf
 
-        return total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_bbox
+        return total_loss, avg_rot, avg_trans, avg_class, avg_conf
 
     def forward(self, x_dict_list, K_list, cad_model_lookup, extrinsics, top_k=100):
-        # Stage 1: Extract features and get per-view detections.
         feat_maps = [self.extract_single_view_features(x_dict) for x_dict in x_dict_list]
         detections_per_view = [self.detect_single_view(f, top_k=top_k)[0][0] for f in feat_maps]
 
@@ -256,27 +239,92 @@ class TwoStagePoseEstimator(nn.Module):
         for i, dets in enumerate(detections_per_view):
             print(f"View {i}: {len(dets)} detections")
 
-        # Stage 2: Multi-view hypothesis matching.
-        object_groups = self.matcher.match(detections_per_view, feat_maps, K_list, extrinsics)
+        object_groups = self.matcher.match(
+            detections_per_view=detections_per_view,
+            feat_maps=feat_maps,
+            K_list=K_list,
+            extrinsics=extrinsics
+        )
+
+    
+
         print("Object groups after matching:")
         for i, group in enumerate(object_groups):
             print(f"Group {i}: {len(group)} detections")
 
-        # Stage 3: Global scene refinement.
-        refined_poses, rendered_views = self.global_refiner(object_groups, cad_model_lookup)
-        print("Refined poses and rendered views:")
-        for i, (pose, view) in enumerate(zip(refined_poses, rendered_views)):
+        refined_poses = self.global_refiner.refine_scene(object_groups, extrinsics, cad_model_lookup)
+
+        print("Refined poses:")
+        for i, pose in enumerate(refined_poses):
             print(f"Pose {i}: {pose}")
-            print(f"View {i}: {view}")
 
-        return object_groups, refined_poses, rendered_views
+        return object_groups, 
 
-    def freeze_refiner(self):
-        for param in self.refiner.parameters():
-            param.requires_grad = False
+    def forward_pose(self, x_dict_views, K_list, extrinsics, top_k=25):
+        device = K_list[0].device
 
-    def freeze_encoder(self):
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        for param in self.det_head.parameters():
-            param.requires_grad = False
+        # -----------------------------
+        # Stage 1: Extract per-view features.
+        # -----------------------------
+        feat_maps = [
+            self.extract_single_view_features({mod: view[mod].unsqueeze(0) for mod in view})
+            for view in x_dict_views
+        ]
+
+        # -----------------------------
+        # Stage 2: Run detection to get candidate detections per view.
+        # -----------------------------
+        detections_per_view = []
+        for feat_map in feat_maps:
+            det_batch, _ = self.detect_single_view(feat_map, top_k=top_k)
+            # det_batch is a list (one per sample); using the first sample only.
+            detections_per_view.append(det_batch[0])
+
+        # -----------------------------
+        # Stage 3: Candidate Pose Sampling and Global Conversion.
+        # -----------------------------
+        all_pred_Rs = []
+        all_pred_ts = []
+        candidate_info = []  # List to store additional information about each candidate.
+        for i, detections in enumerate(detections_per_view):
+            if len(detections) == 0:
+                continue  # If no detection for view i, skip.
+            # Get candidate poses (each of shape: (num_candidates, 4, 4) in camera frame)
+            candidates_per_detection = self.sample_candidates(detections)
+            R_w2c = extrinsics[i]["R_w2c"].to(device)  # (3, 3)
+            t_w2c = extrinsics[i]["t_w2c"].to(device)  # (3,)
+
+            # For every candidate from the sampled detections, convert to global coordinates.
+            for det_idx, cand in enumerate(candidates_per_detection):
+                num_candidates = cand.shape[0]
+                R_candidates = cand[:, :3, :3]  # Candidate rotations in camera frame.
+                t_candidates = cand[:, :3, 3]   # Candidate translations in camera frame.
+
+                # Convert from camera to global (world) coordinates:
+                R_global = torch.matmul(R_w2c.T.unsqueeze(0).expand(num_candidates, -1, -1),
+                                        R_candidates)
+                t_global = torch.matmul(R_w2c.T.unsqueeze(0).expand(num_candidates, -1),
+                                        (t_candidates - t_w2c).unsqueeze(-1)).squeeze(-1)
+
+                all_pred_Rs.append(R_global)
+                all_pred_ts.append(t_global)
+
+                for cand_idx in range(num_candidates):
+                    candidate_info.append({
+                        "view_idx": i,
+                        "detection_idx": det_idx,
+                        "candidate_idx": cand_idx,
+                        "R_global": R_global[cand_idx],
+                        "t_global": t_global[cand_idx],
+                    })
+
+        if len(all_pred_Rs) == 0:
+            # If no candidates were produced, return None (or you could return dummy tensors)
+            return None, None, []
+
+        # Concatenate all candidates along the first dimension.
+        all_pred_Rs = torch.cat(all_pred_Rs, dim=0)  # Shape: (N_pred, 3, 3)
+        all_pred_ts = torch.cat(all_pred_ts, dim=0)  # Shape: (N_pred, 3)
+
+        return all_pred_Rs, all_pred_ts, candidate_info
+

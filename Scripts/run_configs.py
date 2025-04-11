@@ -7,7 +7,8 @@ def run_training(config_path):
     subprocess.run([
         sys.executable,
         # "Scripts/Training/E2E_training.py",
-        # "Scripts/Training/pose_training_fused.py",
+        # "Scripts/Training/cosy/pose_training.py",
+        #  "Scripts/Training/proposed/pose_training.py",
         "Scripts/Training/actual/pose_training.py",
         # "Scripts/Testing/pose_testing_unseen.py",
         #  "Scripts/Testing/pose_testing_seen.py",
