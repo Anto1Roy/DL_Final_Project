@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from Models.ObjectDetection.GridObjectDetector import GridObjectDetector
 from Models.Encoding.FuseNet.FuseNet import FuseNetFeatureEncoder
-from Models.Encoding.ResNet import ResNetFeatureEncoder
+from Models.Encoding.ResNet34 import ResNetFeatureEncoder
 from Models.PoseEstimatorSeen.TransformerFusion import TransformerFusion
 from Models.helpers import hungarian_matching, quaternion_to_matrix
 from scipy.optimize import linear_sum_assignment
@@ -28,6 +28,8 @@ class PoseEstimator(nn.Module):
         self.obj_ids = sorted(list(obj_ids))  # Ensure consistent ordering
         self.obj_id_to_class_idx = {obj_id: idx for idx, obj_id in enumerate(self.obj_ids)}
         self.class_idx_to_obj_id = {idx: obj_id for obj_id, idx in self.obj_id_to_class_idx.items()}
+
+        self.bbox_head = nn.Conv2d(self.out_dim, 4, kernel_size=1) # bbox head for auxiliary loss (proposed by TA)
 
         if encoder_type == "resnet":
             self.encoder = ResNetFeatureEncoder(modality=list(sensory_channels.keys())[0], out_dim=self.out_dim)
@@ -54,11 +56,13 @@ class PoseEstimator(nn.Module):
         raw_outputs = self.det_head(fused_feat)
         outputs = self.det_head.apply_activations(raw_outputs)
         detections = self.det_head.decode_poses(outputs, top_k=top_k)
-        return detections, raw_outputs
+        return detections, raw_outputs, feats
 
     def compute_pose_loss(self, x_dict_views, R_gt_list, t_gt_list, gt_obj_ids, K_list, extrinsics, bbox_gt_list=None, top_k=100):
-        activations, raw_out = self.forward(x_dict_views, K_list=K_list, extrinsics=extrinsics, top_k=top_k)
+        activations, raw_out, feats = self.forward(x_dict_views, K_list=K_list, extrinsics=extrinsics, top_k=top_k)
         outputs = self.det_head.apply_activations(raw_out)
+
+        bbox_preds = [self.bbox_head(f) for f in feats]  # auxiliary loss for tuning the encoder
 
         quat = outputs['quat'][0].reshape(-1, 4)
         trans = outputs['trans'][0].reshape(-1, 3)
@@ -75,20 +79,21 @@ class PoseEstimator(nn.Module):
         total_conf_loss = 0.0
         total_matches = 0
 
-        # Auxiliary bounding box loss
-        if bbox_gt_list is not None:
-            for view_idx, bbox_view in enumerate(bbox_gt_list):
-                K = K_list[view_idx]
-                for j in range(len(quat)):
-                    R_pred = quaternion_to_matrix(quat[j].unsqueeze(0))[0]
-                    t_pred = trans[j]
-                    # Dummy projection point for now
-                    # proj_2d = self.project(R_pred, t_pred, torch.tensor([[0., 0., 0.]], device=device), K)
-                    # x, y = proj_2d[0]
-                    pred_box = torch.tensor([x, y, 1.0, 1.0], device=device)  # dummy box
-                    if j < len(bbox_view.get("bbox_visib_list", [])):
-                        gt_box = torch.tensor(bbox_view["bbox_visib_list"][j], dtype=torch.float32, device=device)
-                        total_bbox_loss += F.l1_loss(pred_box, gt_box)
+        bbox_loss = 0.
+        for i, (bbox_pred, bbox_gt_view) in enumerate(zip(bbox_preds, bbox_gt_list)):
+            B, _, H, W = bbox_pred.shape
+            for b in range(B):
+
+                pred = bbox_pred[b].permute(1, 2, 0)  # [H, W, 4]
+
+                center_h = H // 2
+                center_w = W // 2
+                pred_box = pred[center_h, center_w]
+
+                if b < len(bbox_gt_view.get("bbox_visib_list", [])):
+                    gt_box = torch.tensor(bbox_gt_view["bbox_visib_list"][b], dtype=torch.float32, device=device)
+                    bbox_loss += F.l1_loss(pred_box, gt_box) # proposed by TA
+
 
         # Group GTs by object ID
         gt_by_class = {}
@@ -155,21 +160,10 @@ class PoseEstimator(nn.Module):
         avg_class = total_class_loss / total_matches
         avg_conf = total_conf_loss / len(conf)
         
-        total_loss = avg_rot + avg_trans + avg_class + avg_conf
+        avg_bbox = bbox_loss / len(bbox_gt_list) if bbox_gt_list is not None else torch.tensor(0.0, device=device)
+        total_loss = avg_rot + avg_trans + avg_class + avg_conf + avg_bbox 
 
-        return total_loss, avg_rot, avg_trans, avg_class, avg_conf
-
-    
-    def project(self, R_, t_, model_points, K, eps=1e-6):
-        X_cam = R_ @ model_points.T + t_.view(3, 1)     # (3, N)
-        x_proj = K @ X_cam                              # (3, N)
-        z = x_proj[2].clamp(min=eps)                    # Prevent divide-by-zero
-        return (x_proj[:2] / z).T                # (N, 2)
-
-    def compute_reprojection_loss(self, R, t, R_gt, t_gt, K, model_points):
-        x_proj_pred = self.project(R, t, model_points, K)
-        x_proj_gt = self.project(R_gt, t_gt, model_points, K)
-        return F.mse_loss(x_proj_pred, x_proj_gt)
+        return total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_bbox
 
 
 

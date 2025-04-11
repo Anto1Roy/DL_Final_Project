@@ -1,4 +1,5 @@
 # pose_training_fused.py
+import json
 import os
 import sys
 import yaml
@@ -12,7 +13,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 sys.path.append(os.getcwd())
 from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Classes.EarlyStopping import EarlyStopping
-from Models.PoseEstimator.PoseEstimation import PoseEstimator
+from Models.ProposedPoseEstimator.PoseEstimation import PoseEstimator
 
 
 def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="checkpoint_pose_fused.pt"):
@@ -57,8 +58,8 @@ def move_sample_to_device(sample, device):
         pose["t"] = pose["t"].to(device)
         pose["obj_id"] = pose["obj_id"].to(device)
 
-    # for obj_id in X["model_points_by_id"]:
-    #     X["model_points_by_id"][obj_id] = X["model_points_by_id"][obj_id].to(device)
+    for obj_id in X["cad_lookup"]:
+        X["cad_lookup"][obj_id] = X["cad_lookup"][obj_id].to(device)
 
     for extr in X.get("extrinsics", []):
         extr["R_w2c"] = extr["R_w2c"].to(device)
@@ -87,10 +88,8 @@ def main():
     patience = config["training"].get("patience", 10)
     checkpoint_index = config["training"].get("checkpoint_index", 50)
     val_every = float(config["training"].get("val_every", 50))
-    checkpoint_file = f"checkpoint_{encoder_type}_{fusion_type}.pt"
-    model_path = f"weights/model_{encoder_type}_{fusion_type}.pt"
-
-    renderer_config = config.get("renderer", {"width": 640, "height": 480, "device": device})
+    checkpoint_file = f"pose_checkpoint_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.pt"
+    model_path = f"weights/pose_model_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.pt"
 
     train_scene_ids = {f"{i:06d}" for i in range(0, 25)}
     train_obj_ids = {0, 8, 18, 19, 20}
@@ -114,10 +113,10 @@ def main():
 
     sensory_channels = {mod: 1 for mod in modalities}
     model = PoseEstimator(
-        sensory_channels=sensory_channels,
-        renderer_config=renderer_config,
+        sensory_channels,
         encoder_type=encoder_type,
         fusion_type=fusion_type,
+        obj_ids=train_obj_ids,
         n_views=len(cam_ids),
     ).to(device)
 
@@ -128,7 +127,24 @@ def main():
     early_stopping = EarlyStopping(patience=patience, verbose=True, path=model_path)
 
 
-    start_epoch, _ = load_checkpoint(model, optimizer, scaler, path=checkpoint_file)
+    # start_epoch, _ = load_checkpoint(model, optimizer, scaler, path=checkpoint_file)
+
+    start_epoch = 0
+
+    loss_log = {
+        'batch_idx': [],
+        'epoch': [],
+        'loss': [],
+        'trans': [],
+        'rot': [],
+        'class': [],
+        'conf': [],
+        'render': [],
+        'bbox': [],
+    }
+
+    save_path =f"Logs/loss_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.json"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     for epoch in range(start_epoch, epochs):
         if early_stopping.early_stop:
@@ -147,54 +163,80 @@ def main():
             losses = []
             trans_loss_avg = 0.0
             rot_loss_avg = 0.0
-            desc_loss_avg = 0.0
+            class_loss_avg = 0.0
+            conf_loss_avg = 0.0
+            render_loss_avg = 0.0
+            bbox_loss_avg = 0.0
+            
             sample_avg = 0
 
-            for sample in batch:
-                sample = move_sample_to_device(sample, device)
+            try:
 
-                X, Y = sample["X"], sample["Y"]
+                for sample in batch:
+                    sample = move_sample_to_device(sample, device)
 
-                # Just pass the CADs (obj_id → verts/faces) to the model
-                cad_model_lookup = {
-                    item["obj_id"]: {
-                        "verts": item["verts"],
-                        "faces": item["faces"]
-                    } for item in X["available_cads"]
-                }
+                    X, Y = sample["X"], sample["Y"]
+                    try:
+                        with autocast():
+                            total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_render, avg_bbox  = model.compute_pose_loss(
+                                x_dict_views=X["views"],
+                                R_gt_list=[[pose["R"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                t_gt_list=[[pose["t"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                gt_obj_ids=[[pose["obj_id"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
+                                K_list=X["K"],
+                                extrinsics=X["extrinsics"],
+                                cad_model_lookup=X["cad_lookup"],
+                                bboxes=Y["bbox_visib"], # incorporated after the oral
+                            )
 
-                with autocast():
-                    loss, rot_loss, trans_loss, desc_loss = model.compute_pose_loss(
-                        x_dict_views=X["views"],
-                        R_gt_list=[pose["R"] for pose in Y["gt_poses"]],
-                        t_gt_list=[pose["t"] for pose in Y["gt_poses"]],
-                        K_list=X["K"],
-                        cad_model_lookup=cad_model_lookup
-                    )
+                    except Exception as e:
+                        print(f"[ERROR] {e}")
+                        break
 
-                losses.append(loss)
-                rot_loss_avg += rot_loss.item()
-                trans_loss_avg += trans_loss.item()
-                desc_loss_avg += desc_loss.item()
-                sample_avg += 1
+                    losses.append(total_loss)
+                    rot_loss_avg += avg_rot.item()
+                    trans_loss_avg += avg_trans.item()
+                    class_loss_avg += avg_class.item()
+                    conf_loss_avg += avg_conf.item()
+                    render_loss_avg += avg_render.item()
+                    bbox_loss_avg += avg_bbox.item()
+                    sample_avg += 1
 
-            mean_loss = torch.stack(losses).mean()
-            scaler.scale(mean_loss).backward()
-            scaler.step(optimizer)
-            scheduler.step(mean_loss)
-            scaler.update()
+                mean_loss = torch.stack(losses).mean()
+                scaler.scale(mean_loss).backward()
+                scaler.step(optimizer)
+                scheduler.step(mean_loss)
+                scaler.update()
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                continue
 
-            print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f} | Desc: {desc_loss_avg/sample_avg:.4f}")
+            print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f}")
+            print(f"[INFO] Class Loss: {class_loss_avg/sample_avg:.4f} | Conf Loss: {conf_loss_avg/sample_avg:.4f}")
+            print(f"[INFO] Render Loss: {render_loss_avg/sample_avg:.4f} | BBox Loss: {bbox_loss_avg/sample_avg:.4f}")
+
+
+            loss_log['batch_idx'].append(index)
+            loss_log['epoch'].append(epoch+1)
+            loss_log['loss'].append(total_loss.item())
+            loss_log['trans'].append(avg_trans.item())
+            loss_log['rot'].append(avg_rot.item())
+            loss_log['class'].append(avg_class.item())
+            loss_log['conf'].append(avg_conf.item())
+            loss_log['render'].append(avg_render.item())
+            loss_log['bbox'].append(avg_bbox.item())
 
             if index % checkpoint_index == 0:
                 save_checkpoint(model, optimizer, scaler, epoch, index, path=checkpoint_file)
 
             if index % val_every == 0:
-                early_stopping(mean_loss.item(), model)
+                early_stopping(mean_loss.item(), (class_loss_avg/sample_avg), (trans_loss_avg/sample_avg), (rot_loss_avg/sample_avg), model)
 
             if early_stopping.early_stop:
                 print("[EARLY STOPPING TRIGGERED] Stopping training early based on training loss.")
                 break
+        with open(save_path, "w") as f:
+            json.dump(loss_log, f, indent=4)
 
         total_rot_loss += rot_loss_avg
         total_trans_loss += trans_loss_avg

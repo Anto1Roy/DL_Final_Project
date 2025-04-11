@@ -5,7 +5,6 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from Models.helpers import quaternion_to_matrix
 
-
 class MultiViewMatcher:
     def __init__(self, pose_threshold=1):
         self.pose_threshold = pose_threshold
@@ -20,23 +19,44 @@ class MultiViewMatcher:
         T2[:3, :3], T2[:3, 3] = R2, t2
         return T1 @ torch.linalg.inv(T2)
 
-    def match(self, detections_per_view, feat_maps, K_list):
+    def match(self, detections_per_view, feat_maps, K_list, extrinsics):
+        """
+        Matches candidate detections across views in the global coordinate frame.
+        
+        Args:
+            detections_per_view: List of detections per view.
+            feat_maps: List of feature maps per view.
+            K_list: List of camera intrinsics (one per view).
+            extrinsics: List of dictionaries (one per view), each with keys:
+                        "R_w2c" (Tensor of shape (3,3)) and "t_w2c" (Tensor of shape (3,))
+        
+        Returns:
+            A list of clusters (each a list of detections) that are matched across views.
+        """
         all_detections = []
         for view_idx, detections in enumerate(detections_per_view):
+            ext = extrinsics[view_idx]
+            R_w2c = ext["R_w2c"] 
+            t_w2c = ext["t_w2c"]
             for det in detections:
-                R = quaternion_to_matrix(det['quat'].unsqueeze(0))[0]
+                R_c = quaternion_to_matrix(det['quat'].unsqueeze(0))[0]
+                t_c = det['trans']
+                # Get global pose in world coordinates.
+                R_global = torch.matmul(R_w2c.T, R_c)
+                t_global = torch.matmul(R_w2c.T, (t_c - t_w2c))
                 all_detections.append({
                     'quat': det['quat'],
                     'trans': det['trans'],
-                    'R': R,
+                    'R': R_global,      
                     'view_idx': view_idx,
                     'score': det['score'],
                     'feat': feat_maps[view_idx],
-                    'K': K_list[view_idx]
+                    'K': K_list[view_idx],
+                    'R_global': R_global,
+                    't_global': t_global
                 })
 
         n = len(all_detections)
-
         if n == 0:
             return []
 
@@ -45,9 +65,9 @@ class MultiViewMatcher:
             for j in range(i + 1, n):
                 d1, d2 = all_detections[i], all_detections[j]
                 if d1['view_idx'] == d2['view_idx']:
-                    continue  # skip same view
-
-                dist = self.pose_distance(d1['R'], d1['trans'], d2['R'], d2['trans'])
+                    continue  # Skip detections from the same view
+                dist = self.pose_distance(d1['R_global'], d1['t_global'],
+                                          d2['R_global'], d2['t_global'])
                 if dist < self.pose_threshold:
                     edges.append((i, j))
 
@@ -61,7 +81,6 @@ class MultiViewMatcher:
                 clusters[label].append(all_detections[idx])
             return list(clusters.values())
         else:
-            # Fallback: treat each detection as its own group
             print("[INFO] No matching detections across views — using fallback per-view grouping.")
             clusters = [[d] for d in all_detections]
             return clusters

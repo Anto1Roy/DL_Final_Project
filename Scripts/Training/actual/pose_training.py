@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 sys.path.append(os.getcwd())
 from Classes.Dataset.IPDDataset_render import IPDDatasetMounted
 from Classes.EarlyStopping import EarlyStopping
-from Models.PoseEstimatorSeen.PoseEstimation import PoseEstimator
+from Models.ActualPoseEstimator.PoseEstimation import PoseEstimator
 
 
 def save_checkpoint(model, optimizer, scaler, epoch, batch_idx, path="checkpoint_pose_fused.pt"):
@@ -58,9 +58,6 @@ def move_sample_to_device(sample, device):
         pose["t"] = pose["t"].to(device)
         pose["obj_id"] = pose["obj_id"].to(device)
 
-    # for obj_id in X["model_points_by_id"]:
-    #     X["model_points_by_id"][obj_id] = X["model_points_by_id"][obj_id].to(device)
-
     for extr in X.get("extrinsics", []):
         extr["R_w2c"] = extr["R_w2c"].to(device)
         extr["t_w2c"] = extr["t_w2c"].to(device)
@@ -88,8 +85,8 @@ def main():
     patience = config["training"].get("patience", 10)
     checkpoint_index = config["training"].get("checkpoint_index", 50)
     val_every = float(config["training"].get("val_every", 50))
-    checkpoint_file = f"pose_checkpoint_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}.pt"
-    model_path = f"weights/pose_model_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}.pt"
+    checkpoint_file = f"pose_checkpoint_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.pt"
+    model_path = f"weights/pose_model_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.pt"
 
     train_scene_ids = {f"{i:06d}" for i in range(0, 25)}
     train_obj_ids = {0, 8, 18, 19, 20}
@@ -139,9 +136,10 @@ def main():
         'rot': [],
         'class': [],
         'conf': [],
+        'bbox': [],
     }
 
-    save_path =f"Logs/loss_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}.json"
+    save_path =f"Logs/loss_{encoder_type}_{fusion_type}_{len(modalities)}_{len(cam_ids)}_bbox.json"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     for epoch in range(start_epoch, epochs):
@@ -163,7 +161,7 @@ def main():
             rot_loss_avg = 0.0
             class_loss_avg = 0.0
             conf_loss_avg = 0.0
-            # reproj_loss_avg = 0.0
+            bbox_loss_avg = 0.0
             sample_avg = 0
 
             try:
@@ -174,16 +172,15 @@ def main():
                     X, Y = sample["X"], sample["Y"]
                     try:
                         with autocast():
-                            total_loss, avg_rot, avg_trans, avg_class, avg_conf = model.compute_pose_loss(
+                            total_loss, avg_rot, avg_trans, avg_class, avg_conf, avg_bbox = model.compute_pose_loss(
                                 x_dict_views=X["views"],
                                 R_gt_list=[[pose["R"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
                                 t_gt_list=[[pose["t"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
                                 gt_obj_ids=[[pose["obj_id"] for pose in cam_poses] for cam_poses in Y["gt_poses"]],
                                 K_list=X["K"],
-                                extrinsics=Y["extrinsics"],
+                                extrinsics=X["extrinsics"],
+                                bboxes=Y["bbox_visib"] # incorporated after the oral
                             )
-                            # if needed
-                            # bboxes=Y["bbox_visib"],
 
                     except Exception as e:
                         print(f"[ERROR] {e}")
@@ -194,7 +191,7 @@ def main():
                     trans_loss_avg += avg_trans.item()
                     class_loss_avg += avg_class.item()
                     conf_loss_avg += avg_conf.item()
-                    # reproj_loss_avg += avg_reproj.item()
+                    bbox_loss_avg += avg_bbox.item()
                     sample_avg += 1
 
                 mean_loss = torch.stack(losses).mean()
@@ -207,7 +204,7 @@ def main():
                 continue
 
             print(f"[INFO] Batch {index} Loss: {mean_loss.item():.4f} | Trans: {trans_loss_avg/sample_avg:.4f} | Rot: {rot_loss_avg/sample_avg:.4f}")
-            print(f"[INFO] Class Loss: {class_loss_avg/sample_avg:.4f} | Conf Loss: {conf_loss_avg/sample_avg:.4f}") 
+            print(f"[INFO] Class Loss: {class_loss_avg/sample_avg:.4f} | Conf Loss: {conf_loss_avg/sample_avg:.4f} | BBox Loss: {bbox_loss_avg/sample_avg:.4f}") 
 
 
             loss_log['batch_idx'].append(index)
@@ -217,6 +214,7 @@ def main():
             loss_log['rot'].append(avg_rot.item())
             loss_log['class'].append(avg_class.item())
             loss_log['conf'].append(avg_conf.item())
+            loss_log['bbox'].append(avg_bbox.item())
 
             if index % checkpoint_index == 0:
                 save_checkpoint(model, optimizer, scaler, epoch, index, path=checkpoint_file)

@@ -131,7 +131,7 @@ class IPDDatasetMounted(Dataset):
         gt_all = json.load(open(self.file_manager.get(f"{base_remote}/scene_gt_{primary_cam}.json")))[fid_key]
 
         gt_poses = []
-        # model_points_by_id = {}
+        cad_lookup = {}
 
         for obj in gt_all:
             obj_id = int(obj["obj_id"])
@@ -139,12 +139,13 @@ class IPDDatasetMounted(Dataset):
             t = torch.tensor(obj["cam_t_m2c"], dtype=torch.float32).reshape(3) / 1000.0
             instance_id = obj.get("instance_id", obj_id)  # optional, fallback to obj_id
 
-            # model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+            model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
 
             # load CAD model
-            # if obj_id not in model_points_by_id:
-            #     model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
-            #     model_points_by_id[obj_id] = self.load_cad_model_points(model_path, num_points=500)
+            if obj_id not in cad_lookup:
+                model_path = os.path.join(self.models_dir, f"obj_{obj_id:06d}.ply")
+                mesh = trimesh.load(model_path, force='mesh')
+                cad_lookup[obj_id] = mesh
 
             obj_id = torch.tensor(obj["obj_id"], dtype=torch.float32)
 
@@ -155,19 +156,13 @@ class IPDDatasetMounted(Dataset):
                 "instance_id": instance_id,
             })
 
-            # available_cads.append({
-            #     "obj_id": obj_id,
-            #     "verts": torch.tensor(mesh.vertices, dtype=torch.float32),
-            #     "faces": torch.tensor(mesh.faces, dtype=torch.long),
-            # })
-
         return {
             "X": {
                 "views": x_dict_views,
                 "K": Ks,
-                # "model_points_by_id": model_points_by_id,
                 "extrinsics": scene_cam_extrinsics,
                 "bbox_info": bbox_info_all,
+                "cad_lookup": cad_lookup,
             },
             "Y": {
                 "gt_poses": gt_poses
