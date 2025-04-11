@@ -25,16 +25,16 @@ class FuseDecoder(nn.Module):
             Conv_residual_conv(ngf * 2, ngf * 2, act_fn),
             Conv_residual_conv(ngf, ngf, act_fn),
         ])
-        self.refine = nn.Sequential(
-            nn.Conv2d(ngf, out_dim, kernel_size=3, padding=1),   # make sure it outputs out_dim
-            nn.BatchNorm2d(out_dim),
-            nn.ReLU(),
-        )
+        # self.refine = nn.Sequential(
+        #     nn.Conv2d(ngf, out_dim, kernel_size=3, padding=1),   # make sure it outputs out_dim
+        #     nn.BatchNorm2d(out_dim),
+        #     nn.ReLU(),
+        # )
 
     def forward(self, x, feats):
         for i in range(4):
             x = self.deconv[i](x)
             x = (x + feats[3 - i]) / 2
             x = self.up[i](x)
-        x = self.refine(x)
+        # x = self.refine(x)
         return x
